@@ -1,0 +1,11 @@
+.{
+    .name = .mcp,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.1",
+    .fingerprint = 0xa19bc839375c1e5b,
+    .dependencies = .{
+        .json_tree = .{ .path = "../json_tree" },
+        .services = .{ .path = "../services" },
+    },
+    .paths = .{""},
+}

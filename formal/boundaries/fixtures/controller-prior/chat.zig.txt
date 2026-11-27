@@ -1,0 +1,816 @@
+//! Interactive single-session agent driver with a real read tool.
+
+const std = @import("std");
+const agent = @import("agent");
+const dotenv = @import("dotenv");
+const effects = @import("effects.zig");
+const example_options = @import("example_options");
+const kit = @import("kit");
+const provider = @import("provider.zig");
+const tui = kit.tui;
+const Io = std.Io;
+const Value = std.json.Value;
+
+const prompt_text = "You are a concise assistant. Use the read tool when the user asks about a file.";
+const reset = "\x1b[0m";
+const muted = "\x1b[38;2;181;173;186m";
+const paper = "\x1b[38;2;247;244;232m";
+const accent = "\x1b[38;2;210;203;240m";
+const warning = "\x1b[38;2;255;207;120m";
+const failure = "\x1b[38;2;240;193;211m";
+const block_bytes = 4096;
+const name_capacity = 256;
+
+const Options = struct {
+    live: bool = false,
+    fixture_url: ?[]const u8 = null,
+    env_files: EnvFiles = .default,
+    workspace: []const u8 = ".",
+    session: []const u8 = "chat",
+    journal: ?[]const u8 = null,
+    prompts: []const []const u8 = &.{},
+};
+
+const EnvFiles = union(enum) {
+    default,
+    none,
+    explicit: []const []const u8,
+};
+
+const Phase = enum { idle, running, cancelling, closing };
+
+const Entry = struct {
+    kind: enum { tool_started, tool_finished, fault, stream_started, stream_delta },
+    request_id: []u8,
+    data: std.ArrayList(u8),
+};
+
+const Mailbox = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    mutex: Io.Mutex = .init,
+    entries: std.ArrayList(*Entry) = .empty,
+    bytes: usize = 0,
+
+    fn notify(context: ?*anyopaque, notice: agent.Notice) anyerror!void {
+        const self: *Mailbox = @ptrCast(@alignCast(context.?));
+        const kind: @FieldType(Entry, "kind") = switch (notice.kind) {
+            .tool_started => .tool_started,
+            .tool_finished => .tool_finished,
+            .fault => .fault,
+            else => return,
+        };
+        try self.enqueue(kind, notice.request_id, notice.json);
+    }
+
+    fn preview(context: ?*anyopaque, request_id: []const u8, update: effects.Preview.Update) anyerror!void {
+        const self: *Mailbox = @ptrCast(@alignCast(context.?));
+        switch (update) {
+            .started => try self.enqueue(.stream_started, request_id, ""),
+            .delta => |text| try self.enqueue(.stream_delta, request_id, text),
+        }
+    }
+
+    fn enqueue(self: *Mailbox, kind: @FieldType(Entry, "kind"), id: []const u8, data: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const size = id.len + data.len;
+        if (self.bytes + size > effects.max_response + 1024 * 1024) return error.NoticeOverflow;
+        if (kind == .stream_delta and self.entries.items.len > 0) {
+            const last = self.entries.items[self.entries.items.len - 1];
+            if (last.kind == .stream_delta and std.mem.eql(u8, last.request_id, id)) {
+                try last.data.appendSlice(self.allocator, data);
+                self.bytes += data.len;
+                return;
+            }
+        }
+        if (self.entries.items.len >= 1024) return error.NoticeOverflow;
+        const entry = try self.allocator.create(Entry);
+        errdefer self.allocator.destroy(entry);
+        const request_id = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(request_id);
+        var copied: std.ArrayList(u8) = .empty;
+        errdefer copied.deinit(self.allocator);
+        try copied.appendSlice(self.allocator, data);
+        entry.* = .{
+            .kind = kind,
+            .request_id = request_id,
+            .data = copied,
+        };
+        try self.entries.append(self.allocator, entry);
+        self.bytes += size;
+    }
+
+    fn take(self: *Mailbox) std.ArrayList(*Entry) {
+        var taken: std.ArrayList(*Entry) = .empty;
+        self.mutex.lockUncancelable(self.io);
+        std.mem.swap(std.ArrayList(*Entry), &taken, &self.entries);
+        self.bytes = 0;
+        self.mutex.unlock(self.io);
+        return taken;
+    }
+
+    fn free(self: *Mailbox, entry: *Entry) void {
+        self.allocator.free(entry.request_id);
+        entry.data.deinit(self.allocator);
+        self.allocator.destroy(entry);
+    }
+};
+
+const Turn = struct {
+    id: []const u8,
+    request: *agent.Request,
+    waiter: Io.Future(void),
+    completion: Io.Event = .unset,
+    mutex: Io.Mutex = .init,
+    outcome: ?agent.Outcome = null,
+    wait_failed: bool = false,
+    cancel_request: ?*agent.Request = null,
+    cancel_waiter: ?Io.Future(void) = null,
+
+    fn wait(turn: *Turn, io: Io) void {
+        const outcome = turn.request.wait(io) catch {
+            turn.mutex.lockUncancelable(io);
+            turn.wait_failed = true;
+            turn.mutex.unlock(io);
+            turn.completion.set(io);
+            return;
+        };
+        turn.mutex.lockUncancelable(io);
+        turn.outcome = outcome;
+        turn.mutex.unlock(io);
+        turn.completion.set(io);
+    }
+
+    fn cancelWait(request: *agent.Request, io: Io) void {
+        var outcome = request.wait(io) catch return;
+        outcome.deinit();
+    }
+};
+
+const App = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    arena: std.mem.Allocator,
+    worker: agent.Worker,
+    effects: *effects.Effects,
+    mailbox: Mailbox,
+    journal: []const u8,
+    session: []const u8,
+    workspace: []const u8,
+    mode: []const u8,
+    phase: Phase = .idle,
+    turn: ?Turn = null,
+    input: tui.LineInput = .{},
+    tool: []const u8 = "",
+    notice: []const u8 = "",
+    turn_failed: bool = false,
+    counter: u64 = 0,
+    preview_text: std.ArrayList(u8) = .empty,
+    preview_truncated: bool = false,
+    preview_open: bool = false,
+    preview_scroll: tui.ScrollState = .{ .follow_end = true },
+
+    fn create(
+        allocator: std.mem.Allocator,
+        arena: std.mem.Allocator,
+        io: Io,
+        options: Options,
+        environ: *const std.process.Environ.Map,
+    ) !*App {
+        const self = try allocator.create(App);
+        errdefer allocator.destroy(self);
+        const journal = options.journal orelse try std.fmt.allocPrint(arena, "cpi-agent-{s}.jsonl.gz", .{options.session});
+        const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, options.workspace, arena);
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .arena = arena,
+            .worker = undefined,
+            .effects = undefined,
+            .mailbox = .{ .allocator = allocator, .io = io },
+            .journal = journal,
+            .session = options.session,
+            .workspace = workspace,
+            .mode = if (options.fixture_url != null) "fixture" else "live",
+        };
+        const settings: ?*provider.Provider = if (options.fixture_url == null) blk: {
+            const files: []const dotenv.File = switch (options.env_files) {
+                .default => &.{.{ .path = ".env", .required = false }},
+                .none => &.{},
+                .explicit => |paths| paths_blk: {
+                    const list = try arena.alloc(dotenv.File, paths.len);
+                    for (paths, 0..) |path, index| list[index] = .{ .path = path };
+                    break :paths_blk list;
+                },
+            };
+            var location: dotenv.Diagnostic = .{};
+            var loaded = dotenv.load(arena, io, environ, .{
+                .files = files,
+                .diagnostic = &location,
+            }) catch |err| {
+                std.debug.print("dotenv: {s} (file {?d}, line {d}, column {d})\n", .{
+                    @errorName(err), location.file_index, location.line, location.column,
+                });
+                return err;
+            };
+            defer loaded.deinit();
+            const resolved = try arena.create(provider.Provider);
+            resolved.* = try provider.Provider.init(arena, &loaded);
+            break :blk resolved;
+        } else null;
+        const world = try arena.create(effects.Effects);
+        world.* = if (options.fixture_url) |url|
+            try effects.Effects.initFixture(arena, workspace, url)
+        else
+            effects.Effects.initLive(workspace, settings.?);
+        self.effects = world;
+        world.preview = .{ .context = &self.mailbox, .notify = Mailbox.preview };
+        const tools = try arena.alloc(agent.Tool, 1);
+        tools[0] = .{ .source_name = "read.lua", .source = example_options.read_source };
+        var model: agent.Model = .{ .model = "fixture-model", .instructions = prompt_text, .credential = "" };
+        if (options.fixture_url) |url| {
+            model.base_url = url;
+        } else {
+            model = settings.?.modelConfig(prompt_text);
+        }
+        self.worker = try agent.Worker.open(allocator, io, .{
+            .session_id = options.session,
+            .journal_path = journal,
+            .workspace = workspace,
+            .model = model,
+            .tool_grants = &.{"filesystem.read_text"},
+            .tools = tools,
+            .adapters = world.adapters(),
+            .observer = .{ .context = &self.mailbox, .notify = Mailbox.notify },
+        });
+        return self;
+    }
+
+    fn emit(self: *App, comptime format: []const u8, args: anytype) !void {
+        var buffer: [4096]u8 = undefined;
+        var writer = std.Io.File.stdout().writer(self.io, &buffer);
+        try writer.interface.print(format, args);
+        try writer.interface.flush();
+    }
+
+    fn destroy(self: *App) void {
+        var pending = self.mailbox.take();
+        for (pending.items) |entry| self.mailbox.free(entry);
+        pending.deinit(self.allocator);
+        self.preview_text.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+
+    fn busy(self: *const App) bool {
+        return self.phase == .running or self.phase == .cancelling;
+    }
+
+    fn newId(self: *App, prefix: []const u8) ![]u8 {
+        self.counter += 1;
+        var tag: [8]u8 = undefined;
+        self.io.random(&tag);
+        return std.fmt.allocPrint(self.arena, "{s}-{x}-{d}", .{ prefix, std.mem.readInt(u64, &tag, .little), self.counter });
+    }
+
+    fn submit(self: *App, text: []const u8) !void {
+        if (self.phase != .idle) return;
+        const id = try self.newId("turn");
+        const request = self.worker.submit(id, .{ .input = text }) catch |err| {
+            self.notice = @errorName(err);
+            return err;
+        };
+        self.turn = .{ .id = id, .request = request, .waiter = undefined };
+        const turn = &self.turn.?;
+        turn.waiter = self.io.concurrent(Turn.wait, .{ turn, self.io }) catch |err| {
+            request.deinit();
+            self.turn = null;
+            self.notice = @errorName(err);
+            return err;
+        };
+        self.phase = .running;
+        self.notice = "";
+        self.turn_failed = false;
+        self.tool = "";
+        self.preview_text.clearRetainingCapacity();
+        self.preview_truncated = false;
+        self.preview_open = false;
+    }
+
+    fn cancel(self: *App) void {
+        if (self.phase != .running) return;
+        self.forceCancel();
+    }
+
+    fn forceCancel(self: *App) void {
+        const turn = &self.turn.?;
+        if (turn.cancel_request != null) return;
+        const id = self.newId("cancel") catch return;
+        const request = self.worker.submit(id, .cancel) catch |err| {
+            self.notice = @errorName(err);
+            return;
+        };
+        turn.cancel_request = request;
+        turn.cancel_waiter = self.io.concurrent(Turn.cancelWait, .{ request, self.io }) catch |err| {
+            request.deinit();
+            turn.cancel_request = null;
+            self.notice = @errorName(err);
+            return;
+        };
+        self.phase = .cancelling;
+        self.notice = "";
+    }
+
+    fn settle(self: *App, render: bool, session: ?*tui.Tui, headless: bool) !void {
+        if (self.turn == null) return;
+        const turn = &self.turn.?;
+        turn.completion.waitUncancelable(self.io);
+        turn.waiter.await(self.io);
+        if (turn.cancel_waiter) |*waiter| waiter.await(self.io);
+        if (turn.cancel_request) |request| request.deinit();
+        try self.drain(if (render) session else null, headless);
+        if (headless and self.preview_open) try self.emit("\n", .{});
+        self.preview_open = false;
+        self.preview_text.clearRetainingCapacity();
+        const outcome = turn.outcome;
+        const wait_failed = turn.wait_failed;
+        turn.outcome = null;
+        turn.request.deinit();
+        self.turn = null;
+        self.phase = .idle;
+        self.tool = "";
+        if (wait_failed) {
+            const message = "The worker stopped before this turn finished.";
+            if (render and session != null) {
+                try appendBlock(session.?, .problem, "error", message);
+            }
+            if (headless) try self.emit("error: {s}\n", .{message});
+            self.turn_failed = true;
+            return;
+        }
+        var owned = outcome orelse return;
+        defer owned.deinit();
+        switch (owned.status) {
+            .completed => {
+                const text = switch (owned.result) {
+                    .object => |object| switch (object.get("text") orelse Value.null) {
+                        .string => |value| value,
+                        else => "",
+                    },
+                    else => "",
+                };
+                if (render and session != null) try appendBlock(session.?, .assistant, "assistant", text);
+                if (headless) try self.emit("assistant: {s}\n", .{text});
+            },
+            .cancelled => {
+                if (render and session != null) try appendBlock(session.?, .problem, "cancelled", "The turn was cancelled.");
+                if (headless) try self.emit("cancelled\n", .{});
+                self.turn_failed = true;
+            },
+            .failed => {
+                const reason = diagnostic(owned.diagnostic) orelse "The turn failed.";
+                if (render and session != null) try appendBlock(session.?, .problem, "error", reason);
+                if (headless) try self.emit("error: {s}\n", .{reason});
+                self.turn_failed = true;
+            },
+        }
+    }
+
+    fn drain(self: *App, session: ?*tui.Tui, headless: bool) !void {
+        var entries = self.mailbox.take();
+        defer {
+            for (entries.items) |entry| self.mailbox.free(entry);
+            entries.deinit(self.allocator);
+        }
+        for (entries.items) |entry| {
+            if (entry.kind == .stream_started or entry.kind == .stream_delta) {
+                const turn = self.turn orelse continue;
+                if (!std.mem.eql(u8, turn.id, entry.request_id) or self.phase != .running) continue;
+                if (entry.kind == .stream_started) {
+                    if (headless and self.preview_open) try self.emit("\n", .{});
+                    self.preview_open = false;
+                    self.preview_text.clearRetainingCapacity();
+                    self.preview_truncated = false;
+                    self.preview_scroll = .{ .follow_end = true };
+                } else {
+                    const data = entry.data.items;
+                    if (headless) {
+                        if (!self.preview_open) try self.emit("preview: ", .{});
+                        const clean = try sanitize(self.allocator, data, data.len);
+                        defer self.allocator.free(clean);
+                        try self.emit("{s}", .{clean});
+                    }
+                    self.preview_open = true;
+                    try self.updatePreview(data);
+                }
+                continue;
+            }
+            var parsed = std.json.parseFromSlice(Value, self.allocator, entry.data.items, .{ .allocate = .alloc_always }) catch continue;
+            defer parsed.deinit();
+            switch (entry.kind) {
+                .tool_started => {
+                    if (headless and self.preview_open) try self.emit("\n", .{});
+                    self.preview_open = false;
+                    self.tool = try self.arena.dupe(u8, toolName(parsed.value) orelse "tool");
+                },
+                .tool_finished => {
+                    const name = toolName(parsed.value) orelse "tool";
+                    const body = toolBody(parsed.value);
+                    self.tool = "";
+                    if (session != null and !headless) try appendBlock(session.?, .tool, name, body);
+                    if (headless) try self.emit("tool: {s}\n{s}\n", .{ name, body });
+                },
+                .fault => {
+                    if (session != null and !headless) try appendBlock(session.?, .problem, "fault", entry.data.items);
+                    if (headless) try self.emit("fault: {s}\n", .{entry.data.items});
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn updatePreview(self: *App, data: []const u8) !void {
+        if (data.len >= block_bytes) {
+            var start = data.len - block_bytes;
+            while (start < data.len and data[start] & 0xc0 == 0x80) start += 1;
+            self.preview_text.clearRetainingCapacity();
+            try self.preview_text.appendSlice(self.allocator, data[start..]);
+            self.preview_truncated = self.preview_truncated or start > 0;
+        } else {
+            const old = self.preview_text.items;
+            if (old.len + data.len > block_bytes) {
+                var start = old.len + data.len - block_bytes;
+                while (start < old.len and old[start] & 0xc0 == 0x80) start += 1;
+                std.mem.copyForwards(u8, old, old[start..]);
+                self.preview_text.items.len -= start;
+                self.preview_truncated = true;
+            }
+            try self.preview_text.appendSlice(self.allocator, data);
+        }
+    }
+
+    fn shutdown(self: *App, render: bool, session: ?*tui.Tui) void {
+        self.phase = .closing;
+        if (self.turn != null) {
+            self.forceCancel();
+            self.settleQuiet(render, session) catch {};
+        }
+        const id = self.newId("close") catch return;
+        const request = self.worker.submit(id, .close) catch return;
+        defer request.deinit();
+        var outcome = request.wait(self.io) catch return;
+        outcome.deinit();
+    }
+
+    fn settleQuiet(self: *App, render: bool, session: ?*tui.Tui) !void {
+        if (self.turn) |*turn| {
+            turn.completion.waitUncancelable(self.io);
+        }
+        try self.settle(render, session, false);
+    }
+
+    fn draw(self: *App, session: *tui.Tui) !void {
+        const arena = session.arena;
+        const status = switch (self.phase) {
+            .idle => try std.fmt.allocPrint(arena, "{s}ready{s}{s}  enter send  ·  esc clear  ·  ctrl+c quit{s}", .{ accent, reset, muted, reset }),
+            .running => if (self.tool.len > 0)
+                try std.fmt.allocPrint(arena, "{s}running{s}{s}  tool {s}  ·  esc cancel{s}", .{ warning, reset, muted, self.tool, reset })
+            else
+                try std.fmt.allocPrint(arena, "{s}running{s}{s}  esc cancel{s}", .{ warning, reset, muted, reset }),
+            .cancelling => try std.fmt.allocPrint(arena, "{s}cancelling{s}{s}  waiting for the worker to settle{s}", .{ warning, reset, muted, reset }),
+            .closing => try std.fmt.allocPrint(arena, "{s}closing{s}", .{ muted, reset }),
+        };
+        var children: std.ArrayList(tui.Node) = .empty;
+        if (self.preview_open and self.phase == .running) {
+            const clean = try sanitize(arena, self.preview_text.items, block_bytes);
+            const text = try arena.create(tui.Node);
+            text.* = .{ .text = .{
+                .bytes = if (self.preview_truncated) try std.fmt.allocPrint(arena, "...{s}", .{clean}) else clean,
+            } };
+            try children.append(arena, .{ .box = .{
+                .border = .single,
+                .border_color = .{ .indexed = 240 },
+                .title = "assistant · streaming preview",
+                .children = try arena.dupe(tui.Node, &.{.{ .axis = .{
+                    .direction = .vertical,
+                    .children = try arena.dupe(tui.Track, &.{.{
+                        .basis = .{ .cells = @max(1, @min(8, session.size.row -| 12)) },
+                        .node = .{ .scroll = .{ .child = text, .state = &self.preview_scroll } },
+                    }}),
+                } }}),
+            } });
+        }
+        try children.append(arena, .{ .text = .{ .bytes = status } });
+        if (self.notice.len > 0) try children.append(arena, .{ .text = .{
+            .bytes = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ failure, self.notice, reset }),
+        } });
+        const editor = try self.input.node(arena, "› ");
+        try children.append(arena, .{ .box = .{
+            .border = .single,
+            .border_color = .{ .indexed = 244 },
+            .children = try arena.dupe(tui.Node, &.{editor}),
+        } });
+        try children.append(arena, .{ .text = .{
+            .bytes = try std.fmt.allocPrint(arena, "{s}{s}  ·  {s}{s}", .{ muted, self.session, self.mode, reset }),
+        } });
+        try session.present(.{ .stack = .{ .gap = 1, .children = children.items } }, .{});
+    }
+};
+
+fn toolName(value: Value) ?[]const u8 {
+    if (value != .object) return null;
+    const name = value.object.get("tool_name") orelse return null;
+    return if (name == .string) name.string else null;
+}
+
+fn toolBody(value: Value) []const u8 {
+    if (value != .object) return "{}";
+    if (value.object.get("result")) |result| return jsonText(result);
+    if (value.object.get("error")) |problem| return jsonText(problem);
+    return "{}";
+}
+
+fn jsonText(value: Value) []const u8 {
+    return switch (value) {
+        .string => |text| text,
+        .object => |object| blk: {
+            if (object.get("text")) |item| if (item == .string) break :blk item.string;
+            if (object.get("message")) |item| if (item == .string) break :blk item.string;
+            break :blk "tool result recorded";
+        },
+        else => "tool result recorded",
+    };
+}
+
+fn diagnostic(value: Value) ?[]const u8 {
+    if (value != .object) return null;
+    const message = value.object.get("message") orelse return null;
+    return if (message == .string) message.string else null;
+}
+
+const BlockKind = enum { user, assistant, tool, problem };
+
+fn appendBlock(session: *tui.Tui, kind: BlockKind, title: []const u8, body: []const u8) !void {
+    const arena = session.arena;
+    const clean_body = try sanitize(arena, body, block_bytes);
+    const clean_title = try sanitize(arena, title, 128);
+    const color = switch (kind) {
+        .user => paper,
+        .assistant => paper,
+        .tool => accent,
+        .problem => failure,
+    };
+    const heading = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ color, clean_title, reset });
+    const node: tui.Node = if (kind == .user) .{ .box = .{
+        .padding = .symmetric(1, 2),
+        .background = .{ .indexed = 236 },
+        .children = try arena.dupe(tui.Node, &.{.{ .text = .{ .bytes = clean_body } }}),
+    } } else .{ .box = .{
+        .border = .single,
+        .border_color = .{ .indexed = if (kind == .problem) 174 else 240 },
+        .title = heading,
+        .children = try arena.dupe(tui.Node, &.{.{ .text = .{ .bytes = clean_body, .look = if (kind == .tool) .muted else .plain } }}),
+    } };
+    try session.append(node);
+}
+
+fn sanitize(allocator: std.mem.Allocator, text: []const u8, limit: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var index: usize = 0;
+    while (index < text.len and out.items.len < limit) {
+        const byte = text[index];
+        if (byte == '\n') {
+            try out.append(allocator, '\n');
+            index += 1;
+        } else if (byte == '\t') {
+            try out.append(allocator, ' ');
+            index += 1;
+        } else if (byte == 0xc2 and index + 1 < text.len and text[index + 1] >= 0x80 and text[index + 1] <= 0x9f) {
+            try out.append(allocator, ' ');
+            index += 2;
+        } else if (byte < 0x20 or byte == 0x7f) {
+            try out.append(allocator, ' ');
+            index += 1;
+        } else {
+            const size = std.unicode.utf8ByteSequenceLength(byte) catch {
+                try out.append(allocator, ' ');
+                index += 1;
+                continue;
+            };
+            if (index + size > text.len or !std.unicode.utf8ValidateSlice(text[index .. index + size])) {
+                try out.append(allocator, ' ');
+                index += 1;
+                continue;
+            }
+            if (out.items.len + size > limit) break;
+            try out.appendSlice(allocator, text[index .. index + size]);
+            index += size;
+        }
+    }
+    if (index < text.len) try out.appendSlice(allocator, "...");
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseOptions(allocator: std.mem.Allocator, args: []const []const u8) !Options {
+    var options: Options = .{};
+    var prompts: std.ArrayList([]const u8) = .empty;
+    var env_files: std.ArrayList([]const u8) = .empty;
+    var no_env = false;
+    var index: usize = 1;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--live")) {
+            if (options.fixture_url != null) return error.InvalidArguments;
+            options.live = true;
+        } else if (std.mem.eql(u8, arg, "--fixture-url")) {
+            if (options.live or index + 1 >= args.len) return error.InvalidArguments;
+            index += 1;
+            options.fixture_url = args[index];
+        } else if (std.mem.eql(u8, arg, "--workspace")) {
+            if (index + 1 >= args.len) return error.InvalidArguments;
+            index += 1;
+            options.workspace = args[index];
+        } else if (std.mem.eql(u8, arg, "--session")) {
+            if (index + 1 >= args.len) return error.InvalidArguments;
+            index += 1;
+            options.session = args[index];
+        } else if (std.mem.eql(u8, arg, "--journal")) {
+            if (index + 1 >= args.len) return error.InvalidArguments;
+            index += 1;
+            options.journal = args[index];
+        } else if (std.mem.eql(u8, arg, "--prompt")) {
+            if (index + 1 >= args.len) return error.InvalidArguments;
+            index += 1;
+            try prompts.append(allocator, args[index]);
+        } else if (std.mem.eql(u8, arg, "--env-file")) {
+            if (index + 1 >= args.len) return error.InvalidArguments;
+            index += 1;
+            try env_files.append(allocator, args[index]);
+        } else if (std.mem.eql(u8, arg, "--no-env")) {
+            no_env = true;
+        } else if (std.mem.eql(u8, arg, "--help")) {
+            return error.Help;
+        } else return error.InvalidArguments;
+    }
+    if (options.live == (options.fixture_url != null)) return error.InvalidArguments;
+    if (options.fixture_url != null and (no_env or env_files.items.len > 0)) return error.InvalidArguments;
+    if (no_env and env_files.items.len > 0) return error.InvalidArguments;
+    options.env_files = if (no_env)
+        .none
+    else if (env_files.items.len > 0)
+        .{ .explicit = try env_files.toOwnedSlice(allocator) }
+    else
+        .default;
+    options.prompts = try prompts.toOwnedSlice(allocator);
+    return options;
+}
+
+fn usage() void {
+    std.debug.print(
+        "usage: cpi-agent-chat (--live | --fixture-url http://IP:PORT) [--workspace DIR]\n" ++
+            "       [--session ID] [--journal PATH] [--env-file PATH]... [--no-env] [--prompt TEXT]...\n" ++
+            "  --live reads OPENAI_BASE_URL, OPENAI_API_KEY, and OPENAI_MODEL.\n" ++
+            "  --live also loads .env from the current directory unless --env-file or --no-env is given.\n" ++
+            "  --env-file PATH is required and later files override earlier files; it may repeat.\n" ++
+            "  --fixture-url accepts only an explicit numeric loopback HTTP origin.\n",
+        .{},
+    );
+}
+
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(arena);
+    const options = parseOptions(arena, args) catch |err| switch (err) {
+        error.Help => {
+            usage();
+            return;
+        },
+        else => {
+            usage();
+            return error.InvalidArguments;
+        },
+    };
+    const allocator = std.heap.smp_allocator;
+    var app = try App.create(allocator, arena, init.io, options, init.environ_map);
+    defer app.destroy();
+    defer app.worker.deinit();
+
+    if (options.prompts.len > 0) {
+        var failed = false;
+        for (options.prompts) |prompt| {
+            try app.submit(prompt);
+            const turn = &app.turn.?;
+            while (!turn.completion.isSet()) {
+                try app.drain(null, true);
+                turn.completion.waitTimeout(init.io, .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    else => return err,
+                };
+            }
+            try app.drain(null, true);
+            try app.settle(false, null, true);
+            failed = failed or app.turn_failed;
+        }
+        app.shutdown(false, null);
+        if (failed) return error.TurnFailed;
+        return;
+    }
+
+    var screen: tui.Tui = try .init(allocator, init.io, .{
+        .pool = null,
+        .mode = .main_screen_rerender,
+        .output = .stdout(),
+        .input_file = .stdin(),
+        .input = true,
+        .environment = init.environ_map,
+    });
+    var screen_open = true;
+    defer if (screen_open) screen.deinit();
+
+    try appendBlock(&screen, .user, "session", try std.fmt.allocPrint(arena, "{s}\n{s}", .{ app.workspace, app.journal }));
+    var run_error: ?anyerror = null;
+    while (run_error == null) {
+        app.drain(&screen, false) catch |err| {
+            run_error = err;
+            break;
+        };
+        if (app.turn) |*turn| if (turn.completion.isSet()) {
+            app.settle(true, &screen, false) catch |err| {
+                run_error = err;
+                break;
+            };
+        };
+        app.draw(&screen) catch |err| {
+            run_error = err;
+            break;
+        };
+        const timeout: ?Io.Duration = if (app.busy()) .fromMilliseconds(50) else null;
+        const event = screen.nextEvent(timeout) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => {
+                run_error = err;
+                break;
+            },
+        } orelse {
+            if (screen.input == null) break;
+            continue;
+        };
+        switch (event) {
+            .key => |key| {
+                if (key.kind == .release) continue;
+                if (key.code == .char and key.mods.ctrl and key.code.char == 'c') {
+                    if (app.busy()) app.cancel() else break;
+                    continue;
+                }
+                if (key.code == .char and key.mods.ctrl and key.code.char == 'd') {
+                    if (app.input.text().len == 0) break;
+                    app.notice = "non-empty draft; press enter to submit or ctrl+u to clear";
+                    continue;
+                }
+                const before = app.input.text().len;
+                switch (app.input.handle(key)) {
+                    .submit => {
+                        if (app.phase != .idle) {
+                            app.notice = "busy: the draft stays here until this turn settles";
+                            continue;
+                        }
+                        if (app.input.text().len == 0) continue;
+                        const text = try arena.dupe(u8, app.input.text());
+                        try appendBlock(&screen, .user, "you", text);
+                        app.input.clear();
+                        app.submit(text) catch {};
+                    },
+                    .cancel => {
+                        if (app.phase == .running) {
+                            app.cancel();
+                        } else if (app.phase == .cancelling) {
+                            continue;
+                        } else {
+                            app.input.clear();
+                            app.notice = "";
+                        }
+                    },
+                    .editing => {
+                        if (key.code == .char and !key.mods.ctrl and app.input.text().len == before)
+                            app.notice = "input full (256 bytes)";
+                    },
+                }
+            },
+            .paste => |bytes| {
+                const before = app.input.text().len;
+                app.input.insert(bytes);
+                const after = app.input.text().len;
+                if (bytes.len > 0 and after == before) {
+                    app.notice = "paste rejected (256-byte input limit)";
+                } else if (after - before < bytes.len) {
+                    app.notice = "paste truncated at the 256-byte input limit";
+                } else app.notice = "";
+            },
+            else => {},
+        }
+    }
+    screen.deinit();
+    screen_open = false;
+    app.shutdown(false, null);
+    if (run_error) |err| return err;
+}

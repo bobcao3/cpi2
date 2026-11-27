@@ -1,0 +1,20 @@
+.{
+    .name = .agent,
+    .version = "0.0.1",
+    .dependencies = .{
+        .json_tree = .{ .path = "../json_tree" },
+        .luau = .{ .path = "../../vendor/luau" },
+        .services = .{ .path = "../services" },
+        .kit = .{
+            .url = "git+https://forge.bc3.moe/bob/Kit.zig#24f6742702cf7a5906d8c5f8a4dd4aaf28aac341",
+            .hash = "kit-0.0.0-1RjPzrdxTAB84D1BAsFQ-3htf5ZALOlm7O1Ls1kPj5xa",
+        },
+        .zstd = .{
+            .url = "../../vendor/zstd",
+            .hash = "zstd-0.0.0-4S-Rv3MRAABdPmv8AYLrhkqwp659FBTllX-qOGbRSFKB",
+        },
+    },
+    .minimum_zig_version = "0.17.1",
+    .paths = .{""},
+    .fingerprint = 0x268b9c9d9e1665cb,
+}

@@ -1,0 +1,8 @@
+.{
+    .name = .model_registry,
+    .version = "0.0.1",
+    .fingerprint = 0x7724ce9f3de5a75,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{ .agent = .{ .path = "../agent" }, .luau = .{ .path = "../../vendor/luau" }, .services = .{ .path = "../services" } },
+    .paths = .{""},
+}

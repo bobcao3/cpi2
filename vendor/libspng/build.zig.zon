@@ -1,0 +1,17 @@
+.{
+    .name = .libspng,
+    .version = "0.7.4",
+    .minimum_zig_version = "0.17.1",
+    .fingerprint = 0x18a056a0bf1e2d90,
+    .dependencies = .{
+        .upstream = .{
+            .url = "git+https://github.com/randy408/libspng#fb768002d4288590083a476af628e51c3f1d47cd",
+            .hash = "N-V-__8AAModCAATNPKPcCapFcZFQHw0a8VjUyjAokEkvmW7",
+        },
+        .miniz = .{
+            .url = "git+https://github.com/richgel999/miniz#77d0dce8627735138c51770d1799a1ef48f2117d",
+            .hash = "N-V-__8AAJmKFgANnVgLMCG4IKGFiSk_OceSUlZrQfI_Lo-r",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon" },
+}

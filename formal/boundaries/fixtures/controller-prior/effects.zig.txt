@@ -1,0 +1,147 @@
+//! Provider and filesystem callbacks for the native chat example.
+
+const std = @import("std");
+const agent = @import("agent");
+const provider = @import("provider.zig");
+const stream = agent.provider;
+
+pub const Preview = stream.Preview;
+
+const Io = std.Io;
+const Value = std.json.Value;
+
+pub const max_body = agent.provider.max_body;
+pub const max_response = agent.provider.max_response;
+
+pub const Mode = agent.provider.Mode;
+pub const Fixture = agent.provider.Fixture;
+
+pub const Effects = struct {
+    workspace: []const u8,
+    mode: Mode,
+    preview: ?Preview = null,
+
+    pub fn initLive(workspace: []const u8, settings: *const provider.Provider) Effects {
+        return .{ .workspace = workspace, .mode = .{ .live = settings } };
+    }
+
+    pub fn initFixture(allocator: std.mem.Allocator, workspace: []const u8, url: []const u8) !Effects {
+        const shared = try agent.provider.Effects.initFixture(allocator, workspace, url);
+        const fixture = shared.mode.fixture;
+        return .{ .workspace = workspace, .mode = .{ .fixture = fixture } };
+    }
+
+    pub fn adapters(self: *Effects) agent.Adapters {
+        return .{
+            .http = .{ .context = self, .call = httpCall },
+            .rpc = .{ .context = self, .call = rpcCall },
+        };
+    }
+};
+
+fn errorResponse(allocator: std.mem.Allocator, code: []const u8, message: []const u8) !agent.AdapterResponse {
+    return .{ .json = try std.json.Stringify.valueAlloc(allocator, .{ .code = code, .message = message }, .{}), .failed = true };
+}
+
+fn objectField(value: Value, name: []const u8) ?Value {
+    if (value != .object) return null;
+    return value.object.get(name);
+}
+
+fn httpCall(context: ?*anyopaque, allocator: std.mem.Allocator, io: Io, request: agent.AdapterRequest) !agent.AdapterResponse {
+    const self: *Effects = @ptrCast(@alignCast(context.?));
+    var shared: agent.provider.Effects = .{ .workspace = self.workspace, .mode = self.mode, .preview = self.preview };
+    const adapter = shared.adapters().http.?;
+    return adapter.call(adapter.context, allocator, io, request);
+}
+
+fn rpcCall(context: ?*anyopaque, allocator: std.mem.Allocator, io: Io, request: agent.AdapterRequest) !agent.AdapterResponse {
+    const self: *Effects = @ptrCast(@alignCast(context.?));
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const packet = std.json.parseFromSlice(Value, arena, request.json, .{ .allocate = .alloc_if_needed }) catch
+        return errorResponse(allocator, "invalid_request", "Adapter packet is not JSON.");
+    const endpoint = switch (objectField(packet.value, "endpoint") orelse return errorResponse(allocator, "invalid_request", "Missing endpoint.")) {
+        .string => |text| text,
+        else => return errorResponse(allocator, "invalid_request", "Endpoint must be a string."),
+    };
+    if (!std.mem.eql(u8, endpoint, "filesystem.read_text"))
+        return errorResponse(allocator, "permission_denied", "Only filesystem.read_text is available.");
+    const arguments = objectField(packet.value, "arguments") orelse
+        return errorResponse(allocator, "invalid_request", "Missing arguments.");
+    return readText(self.workspace, allocator, io, arguments);
+}
+
+fn readText(workspace: []const u8, allocator: std.mem.Allocator, io: Io, arguments: Value) !agent.AdapterResponse {
+    if (arguments != .object) return errorResponse(allocator, "invalid_argument", "Arguments must be an object.");
+    const path = switch (arguments.object.get("path") orelse return errorResponse(allocator, "invalid_argument", "Invalid file path.")) {
+        .string => |text| text,
+        else => return errorResponse(allocator, "invalid_argument", "Invalid file path."),
+    };
+    if (path.len == 0 or path.len > 4096 or std.mem.findScalar(u8, path, 0) != null or path[0] == '/')
+        return errorResponse(allocator, "invalid_argument", "Invalid file path.");
+    const offset_value = arguments.object.get("offset_bytes") orelse Value{ .integer = 0 };
+    if (offset_value != .integer or offset_value.integer < 0)
+        return errorResponse(allocator, "invalid_argument", "Invalid byte offset.");
+    const max_value = arguments.object.get("max_bytes") orelse Value{ .integer = 65536 };
+    if (max_value != .integer or max_value.integer < 1 or max_value.integer > 1024 * 1024)
+        return errorResponse(allocator, "invalid_argument", "Invalid byte limit.");
+    const offset: u64 = @intCast(offset_value.integer);
+    const maximum: usize = @intCast(max_value.integer);
+
+    var directory_flags: std.posix.O = .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true };
+    if (@hasField(std.posix.O, "DIRECTORY")) directory_flags.DIRECTORY = true;
+    var root = std.posix.openat(std.posix.AT.FDCWD, workspace, directory_flags, 0) catch
+        return errorResponse(allocator, "permission_denied", "Workspace cannot be opened.");
+    var root_open = true;
+    defer if (root_open) closeFd(io, root);
+
+    var components = std.mem.splitScalar(u8, path, '/');
+    var component = components.next();
+    while (component) |part| {
+        const next = components.next();
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) {
+            component = next;
+            continue;
+        }
+        if (std.mem.eql(u8, part, "..")) return errorResponse(allocator, "permission_denied", "File is outside workspace.");
+        if (next != null) {
+            const child = std.posix.openat(root, part, directory_flags, 0) catch
+                return errorResponse(allocator, "invalid_argument", "Invalid file path.");
+            closeFd(io, root);
+            root = child;
+            component = next;
+            continue;
+        }
+        const file_flags: std.posix.O = .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true };
+        const fd = std.posix.openat(root, part, file_flags, 0) catch
+            return errorResponse(allocator, "invalid_argument", "Invalid file path.");
+        root_open = false;
+        closeFd(io, root);
+        const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+        defer file.close(io);
+        const stat = file.stat(io) catch return errorResponse(allocator, "invalid_argument", "Invalid file range.");
+        if (stat.kind != .file or offset > stat.size)
+            return errorResponse(allocator, "invalid_argument", "Invalid file range.");
+        const buffer = try allocator.alloc(u8, maximum);
+        defer allocator.free(buffer);
+        const read = file.readPositionalAll(io, buffer, offset) catch
+            return errorResponse(allocator, "invalid_argument", "Invalid file range.");
+        const text = buffer[0..read];
+        if (!std.unicode.utf8ValidateSlice(text))
+            return errorResponse(allocator, "invalid_utf8", "Range is not complete UTF-8 text.");
+        const next_offset = offset + read;
+        return .{ .json = try std.json.Stringify.valueAlloc(allocator, .{
+            .text = text,
+            .next_offset_bytes = next_offset,
+            .truncated = next_offset < stat.size,
+        }, .{}) };
+    }
+    return errorResponse(allocator, "invalid_argument", "Invalid file path.");
+}
+
+fn closeFd(io: Io, fd: std.posix.fd_t) void {
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    file.close(io);
+}

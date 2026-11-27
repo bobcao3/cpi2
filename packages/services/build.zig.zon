@@ -1,0 +1,8 @@
+.{
+    .name = .services,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{ .json_tree = .{ .path = "../json_tree" } },
+    .paths = .{""},
+    .fingerprint = 0x7332e16912975ed8,
+}

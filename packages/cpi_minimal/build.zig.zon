@@ -1,0 +1,28 @@
+.{
+    .name = .cpi_minimal,
+    .version = "0.0.1",
+    .dependencies = .{
+        .json_tree = .{ .path = "../json_tree" },
+        .agent = .{ .path = "../agent" },
+        .services = .{ .path = "../services" },
+        .dotenv = .{ .path = "../dotenv" },
+        .model_registry = .{ .path = "../model_registry" },
+        .mcp = .{ .path = "../mcp" },
+        .tree_sitter = .{ .path = "../../vendor/tree_sitter" },
+        .libspng = .{ .path = "../../vendor/libspng" },
+        .jpegli = .{ .path = "../../vendor/jpegli" },
+        .stb_image = .{ .path = "../../vendor/stb_image" },
+        .libwebp = .{ .path = "../../vendor/libwebp" },
+        .kit = .{
+            .url = "git+https://forge.bc3.moe/bob/Kit.zig#24f6742702cf7a5906d8c5f8a4dd4aaf28aac341",
+            .hash = "kit-0.0.0-1RjPzrdxTAB84D1BAsFQ-3htf5ZALOlm7O1Ls1kPj5xa",
+        },
+        .pi_coding_agent = .{
+            .url = "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-1.6.1.tgz",
+            .hash = "N-V-__8AADJ9fAE-d-9DwTjUR0zjF5mRofgNB7hdQbyozY1P",
+        },
+    },
+    .minimum_zig_version = "0.17.1",
+    .fingerprint = 0xf5653f2c8daa007d,
+    .paths = .{""},
+}

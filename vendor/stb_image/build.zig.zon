@@ -1,0 +1,13 @@
+.{
+    .name = .stb_image,
+    .version = "2.34.0",
+    .minimum_zig_version = "0.17.1",
+    .fingerprint = 0xe5d3607888668a19,
+    .dependencies = .{
+        .upstream = .{
+            .url = "git+https://github.com/nothings/stb#6b5799bae8a1fe3792691ef4b72ae26434c3e799",
+            .hash = "N-V-__8AAMNjVQBtQqFTqLXf4ajZ6COgMe1AG_STJHG4jkdj",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

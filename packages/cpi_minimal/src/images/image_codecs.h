@@ -1,0 +1,5 @@
+#include "image_jpeg.h"
+#include "spng.h"
+#include "stb_image_gif_bmp.h"
+#include "webp/decode.h"
+#include "webp/demux.h"

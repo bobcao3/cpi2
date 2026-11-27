@@ -1,0 +1,47 @@
+{
+  "name": "@cpi/ghostmux",
+  "version": "0.0.7",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./bin/ghostmux-resolve.mjs",
+    "./resolve": "./bin/ghostmux-resolve.mjs",
+    "./source": "./bin/ghostmux-source.mjs",
+    "./signature": "./bin/ghostmux-signature.mjs",
+    "./package": "./scripts/ghostmux-package.mjs",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "ghostmux": "./bin/ghostmux.mjs"
+  },
+  "files": [
+    "bin/ghostmux.mjs",
+    "bin/ghostmux-resolve.mjs",
+    "bin/ghostmux-resolve.d.mts",
+    "bin/ghostmux-source.mjs",
+    "bin/ghostmux-source.d.mts",
+    "bin/ghostmux-signature.mjs",
+    "bin/ghostmux-signature.d.mts",
+    "platforms.json",
+    "native.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "zig build --release=safe",
+    "pack:release": "node scripts/package.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "release": "node scripts/ghostmux-release.mjs"
+  },
+  "devDependencies": {
+    "sharp": "0.35.4"
+  },
+  "optionalDependencies": {
+    "@cpi/ghostmux-linux-x64": "npm:@bobcao3/cpi-ghostmux-linux-x64@0.0.1",
+    "@cpi/ghostmux-linux-arm64": "npm:@bobcao3/cpi-ghostmux-linux-arm64@0.0.1",
+    "@cpi/ghostmux-darwin-x64": "npm:@bobcao3/cpi-ghostmux-darwin-x64@0.0.1",
+    "@cpi/ghostmux-darwin-arm64": "npm:@bobcao3/cpi-ghostmux-darwin-arm64@0.0.1",
+    "@cpi/ghostmux-win32-x64": "npm:@bobcao3/cpi-ghostmux-win32-x64@0.0.1"
+  }
+}

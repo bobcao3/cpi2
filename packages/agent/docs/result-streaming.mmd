@@ -1,0 +1,17 @@
+flowchart TB
+    H["HTTP host"] -->|"META / DATA / end"| I["Bounded ingress"]
+    I --> R["ModelStream.zig<br/>owns wire decoders"]
+    R -->|"Preview"| P["ProgressBatch.zig"]
+    P -->|"PROGRESS: zero sequence"| O["EventOutbox.zig<br/>prepared events + leases"]
+    R -->|"Moves ModelResult"| M["model.zig<br/>acceptResult"]
+    M -->|"Snapshot"| J["Journal"]
+    J -->|"IO_DONE"| I
+    I -->|"Append ack"| M
+    M -->|"Prepared commit notice"| O
+    O --> U["Observer / UI"]
+    classDef normal fill:#f7f4e8,stroke:#0c1115,color:#0c1115,stroke-width:2px;
+    classDef worker fill:#d8d2f2,stroke:#0c1115,color:#0c1115,stroke-width:2px;
+    classDef durable fill:#c8dfce,stroke:#0c1115,color:#0c1115,stroke-width:2px;
+    class H,I,P,O,U normal;
+    class R worker;
+    class M,J durable;

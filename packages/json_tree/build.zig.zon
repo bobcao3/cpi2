@@ -1,0 +1,13 @@
+.{
+    .name = .json_tree,
+    .version = "0.0.1",
+    .dependencies = .{
+        .kit = .{
+            .url = "git+https://forge.bc3.moe/bob/Kit.zig#24f6742702cf7a5906d8c5f8a4dd4aaf28aac341",
+            .hash = "kit-0.0.0-1RjPzrdxTAB84D1BAsFQ-3htf5ZALOlm7O1Ls1kPj5xa",
+        },
+    },
+    .fingerprint = 0x6ea2021b8d1f5e46,
+    .minimum_zig_version = "0.17.1",
+    .paths = .{""},
+}

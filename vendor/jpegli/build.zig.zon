@@ -1,0 +1,21 @@
+.{
+    .name = .jpegli,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.1",
+    .fingerprint = 0x5d394a932d8879d6,
+    .dependencies = .{
+        .upstream = .{
+            .url = "git+https://github.com/google/jpegli#c7d342c25d3587ac0110c915989ad94f414b6c8d",
+            .hash = "N-V-__8AANf9JQAFqOUxlsjJN51z6ChgnTaiUW0UNh-P6TPO",
+        },
+        .highway = .{
+            .url = "git+https://github.com/google/highway#271a9a0ed9de1232d9117f1572c3fe28f8542ec1",
+            .hash = "N-V-__8AAOrWjQAen4a3xKOOKRpYwiaA7MbAVGyMPJzQk3nr",
+        },
+        .libjpeg_turbo = .{
+            .url = "git+https://github.com/libjpeg-turbo/libjpeg-turbo#8ecba3647edb6dd940463fedf38ca33a8e2a73d1",
+            .hash = "N-V-__8AAFSUgADpLNS5Jc5gFiYjpPaIw5yO7iJy-x1cErJf",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon" },
+}

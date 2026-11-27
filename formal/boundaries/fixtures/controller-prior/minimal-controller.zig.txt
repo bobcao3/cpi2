@@ -1,0 +1,539 @@
+const std = @import("std");
+const agent = @import("agent");
+const services = @import("services");
+const transport = agent.provider;
+const j = @import("json.zig");
+const Session = @import("Session.zig");
+const Tools = @import("CodingFiles.zig");
+const compaction = @import("compaction.zig");
+const prompts = @import("prompts.zig");
+const Skills = @import("Skills.zig");
+const skill_paths = @import("skill_paths.zig");
+const Self = @This();
+const Value = j.Value;
+pub const Prepared = Skills.Prepared;
+pub const Provider = transport.Provider;
+
+pub const Settings = struct {
+    workspace: []const u8,
+    session_directory: []const u8,
+    session_path: ?[]const u8,
+    context_window: u64 = 128000,
+    reserve_tokens: u64 = 16384,
+    keep_recent_tokens: u64 = 20000,
+    max_output_tokens: u32 = 16384,
+    reasoning_effort: ?[]const u8 = null,
+    skill_paths: []const []const u8 = &.{},
+    no_skills: bool = false,
+};
+pub const EventKind = enum { user, assistant_start, text_delta, assistant, thinking, tool_start, tool_end, compacting, compacted, notice };
+pub const Event = struct { kind: EventKind, text: []const u8 = "", name: []const u8 = "", data: Value = .null, tokens: u64 = 0 };
+pub const Sink = struct { context: ?*anyopaque, emit: *const fn (?*anyopaque, Event) anyerror!void };
+
+a: std.mem.Allocator,
+gpa: std.mem.Allocator,
+io: std.Io,
+settings: Settings,
+provider: *Provider,
+session: Session,
+view_arena: std.heap.ArenaAllocator,
+worker: ?agent.Worker = null,
+registry: services.Registry,
+exec: services.Exec,
+tools: Tools,
+effects: transport.Effects,
+shell_environment: std.process.Environ.Map,
+system_prompt: []const u8,
+skills: Skills,
+skill_options: Skills.Options,
+sink: ?Sink = null,
+stop: std.atomic.Value(bool) = .init(false),
+context_tokens: std.atomic.Value(u64) = .init(0),
+summarizing: bool = false,
+steering_mutex: std.Io.Mutex = .init,
+admission: enum { closed, running } = .closed,
+steering: std.ArrayList(Prepared) = .empty,
+
+pub fn create(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, settings: Settings, provider: *Provider, environ: *const std.process.Environ.Map) !*Self {
+    if (settings.context_window <= settings.reserve_tokens or settings.keep_recent_tokens == 0 or settings.max_output_tokens == 0) return error.InvalidContextSettings;
+    const home = environ.get("HOME") orelse ".";
+    const configured_agent_dir = environ.get("PI_CODING_AGENT_DIR") orelse "";
+    const agent_dir = if (configured_agent_dir.len > 0) try skill_paths.resolve(a, settings.workspace, home, configured_agent_dir) else try std.fs.path.join(a, &.{ home, ".pi", "agent" });
+    const skill_options: Skills.Options = .{ .cwd = settings.workspace, .home = home, .agent_dir = agent_dir, .explicit_paths = settings.skill_paths, .no_skills = settings.no_skills };
+    var skills = try Skills.load(gpa, io, skill_options);
+    errdefer skills.deinit();
+    const self = try a.create(Self);
+    self.* = .{
+        .a = a,
+        .gpa = gpa,
+        .io = io,
+        .settings = settings,
+        .provider = provider,
+        .session = .{ .path = settings.session_path },
+        .view_arena = std.heap.ArenaAllocator.init(gpa),
+        .registry = services.Registry.init(gpa),
+        .exec = undefined,
+        .tools = undefined,
+        .effects = transport.Effects.initLive(settings.workspace, provider),
+        .shell_environment = .init(gpa),
+        .system_prompt = try prompts.system(a, settings.workspace, try skills.prompt(a)),
+        .skills = skills,
+        .skill_options = skill_options,
+    };
+    errdefer self.registry.deinit();
+    errdefer self.view_arena.deinit();
+    errdefer self.shell_environment.deinit();
+    var env = environ.iterator();
+    while (env.next()) |entry| try self.shell_environment.put(entry.key_ptr.*, entry.value_ptr.*);
+    const output = try std.fs.path.join(a, &.{ settings.session_directory, "tool-output" });
+    try std.Io.Dir.cwd().createDirPath(io, output);
+    self.tools = .{ .workspace = settings.workspace, .output_directory = output, .environ = &self.shell_environment };
+    self.effects.preview = .{ .context = self, .notify = preview };
+    self.exec = .{ .directory = output, .environment = &self.shell_environment };
+    errdefer self.exec.deinit(io, .terminate);
+    try self.registry.add(self.tools.service());
+    try self.registry.add(self.exec.service());
+    self.worker = try self.openWorker(settings.session_path);
+    errdefer self.worker.?.deinit();
+    try self.metadata();
+    try self.refresh();
+    return self;
+}
+
+pub fn close(self: *Self) void {
+    if (self.worker) |*worker| worker.deinit();
+    self.exec.deinit(self.io, .detach);
+    self.registry.deinit();
+    self.view_arena.deinit();
+    self.shell_environment.deinit();
+    self.skills.deinit();
+    for (self.steering.items) |input| {
+        self.gpa.free(input.text);
+        self.gpa.free(input.original);
+    }
+    self.steering.deinit(self.gpa);
+}
+
+pub fn sessionPath(self: *const Self) []const u8 {
+    return self.session.path orelse "(memory)";
+}
+pub fn modelName(self: *const Self) []const u8 {
+    return self.provider.model;
+}
+pub fn contextTokens(self: *const Self) u64 {
+    return self.context_tokens.load(.acquire);
+}
+pub fn cancel(self: *Self) void {
+    self.stop.store(true, .release);
+    const request = self.submit(.cancel) catch return;
+    request.deinit();
+}
+
+fn emit(self: *Self, event: Event) !void {
+    if (self.sink) |sink| try sink.emit(sink.context, event);
+}
+
+pub fn prepare(self: *Self, a: std.mem.Allocator, text: []const u8) !Prepared {
+    const expanded = try self.skills.expand(a, self.io, text);
+    if (expanded.diagnostic) |diagnostic| try self.emit(.{ .kind = .notice, .text = try std.fmt.allocPrint(a, "{s}: {s}", .{ diagnostic.path, diagnostic.message }) });
+    return expanded.input;
+}
+
+pub fn reportSkills(self: *Self) !void {
+    for (self.skills.diagnostics) |diagnostic| try self.emit(.{ .kind = .notice, .text = try std.fmt.allocPrint(self.a, "{s}: {s}", .{ diagnostic.path, diagnostic.message }) });
+}
+
+pub fn reloadSkills(self: *Self) !void {
+    var next = try Skills.load(self.gpa, self.io, self.skill_options);
+    const system_prompt = blk: {
+        errdefer next.deinit();
+        break :blk try prompts.system(self.a, self.settings.workspace, try next.prompt(self.a));
+    };
+    self.skills.deinit();
+    self.skills = next;
+    self.system_prompt = system_prompt;
+    try self.refresh();
+    try self.reportSkills();
+}
+
+pub fn steer(self: *Self, input: Prepared) !bool {
+    self.steering_mutex.lockUncancelable(self.io);
+    defer self.steering_mutex.unlock(self.io);
+    if (self.admission == .closed) return false;
+    const owned = try self.gpa.dupe(u8, input.text);
+    errdefer self.gpa.free(owned);
+    const original = try self.gpa.dupe(u8, input.original);
+    errdefer self.gpa.free(original);
+    try self.steering.append(self.gpa, .{ .text = owned, .original = original });
+    return true;
+}
+
+pub fn withdrawSteering(self: *Self, a: std.mem.Allocator) !?[]const u8 {
+    self.steering_mutex.lockUncancelable(self.io);
+    defer self.steering_mutex.unlock(self.io);
+    const input = self.steering.pop() orelse return null;
+    defer self.gpa.free(input.text);
+    defer self.gpa.free(input.original);
+    return try a.dupe(u8, input.original);
+}
+
+pub fn takeSteering(self: *Self, a: std.mem.Allocator) ![]const []const u8 {
+    self.steering_mutex.lockUncancelable(self.io);
+    defer self.steering_mutex.unlock(self.io);
+    const restored = try a.alloc([]const u8, self.steering.items.len);
+    for (self.steering.items, 0..) |input, i| restored[i] = try a.dupe(u8, input.text);
+    for (self.steering.items) |input| {
+        self.gpa.free(input.text);
+        self.gpa.free(input.original);
+    }
+    self.steering.clearRetainingCapacity();
+    self.admission = .closed;
+    return restored;
+}
+
+fn admitSteering(self: *Self) !void {
+    self.steering_mutex.lockUncancelable(self.io);
+    defer self.steering_mutex.unlock(self.io);
+    while (self.steering.items.len > 0) {
+        const input = self.steering.items[0];
+        const request = try self.submit(.{ .steer = .{ .content = input.text, .policy = .at_boundary } });
+        defer request.deinit();
+        var outcome = try request.wait(self.io);
+        defer outcome.deinit();
+        if (outcome.status != .completed) return;
+        _ = self.steering.orderedRemove(0);
+        self.gpa.free(input.text);
+        self.gpa.free(input.original);
+    }
+}
+
+fn metadata(self: *Self) !void {
+    try self.shell_environment.put("PI_SESSION_FILE", self.sessionPath());
+    try self.shell_environment.put("PI_SESSION_ID", std.fs.path.stem(self.sessionPath()));
+    try self.shell_environment.put("PI_MODEL", self.modelName());
+    try self.shell_environment.put("PI_PROVIDER", "openai-compatible");
+    try self.shell_environment.put("PI_REASONING_LEVEL", self.settings.reasoning_effort orelse "off");
+}
+
+pub fn newSession(self: *Self) !void {
+    var nonce: [16]u8 = undefined;
+    self.io.random(&nonce);
+    const path = try std.fmt.allocPrint(self.a, "{s}/{s}.jsonl", .{ self.settings.session_directory, std.fmt.bytesToHex(nonce, .lower) });
+    try self.changeSession(path);
+}
+
+pub fn changeSession(self: *Self, path: ?[]const u8) !void {
+    if (path != null and self.session.path != null and std.mem.eql(u8, path.?, self.session.path.?)) return;
+    var next = try self.openWorker(path);
+    errdefer next.deinit();
+    self.worker.?.deinit();
+    self.worker = next;
+    self.session.path = if (path) |location| try self.a.dupe(u8, location) else null;
+    try self.metadata();
+    try self.refresh();
+}
+
+pub fn select(self: *Self, id: []const u8) !void {
+    var snapshot = try self.worker.?.readConversation(self.gpa);
+    defer snapshot.deinit();
+    var outcome = try self.execute(.{ .branch = .{ .expected_revision = snapshot.revision, .at = id } });
+    defer outcome.deinit();
+    try self.refresh();
+}
+
+pub fn setModel(self: *Self, name: []const u8) !void {
+    if (name.len == 0) return error.InvalidModel;
+    for (name) |byte| if (byte <= 0x20 or byte == 0x7f) return error.InvalidModel;
+    self.provider.model = try self.a.dupe(u8, name);
+    try self.metadata();
+    try self.refresh();
+}
+
+fn preview(raw: ?*anyopaque, _: []const u8, update: transport.Preview.Update) !void {
+    const self: *Self = @ptrCast(@alignCast(raw.?));
+    if (self.summarizing) return;
+    switch (update) {
+        .started => try self.emit(.{ .kind = .assistant_start }),
+        .delta => |delta| try self.emit(.{ .kind = .text_delta, .text = delta }),
+    }
+}
+
+fn submit(self: *Self, command: agent.Command) !*agent.Request {
+    var nonce: [16]u8 = undefined;
+    self.io.random(&nonce);
+    return self.worker.?.submit(&std.fmt.bytesToHex(nonce, .lower), command);
+}
+
+fn execute(self: *Self, command: agent.Command) !agent.Outcome {
+    const request = try self.submit(command);
+    defer request.deinit();
+    var outcome = request.wait(self.io) catch |err| {
+        const protection = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(protection);
+        self.cancel();
+        var stopped = try request.wait(self.io);
+        stopped.deinit();
+        return err;
+    };
+    if (outcome.status != .completed) {
+        defer outcome.deinit();
+        try self.emit(.{ .kind = .notice, .text = j.text(j.get(outcome.diagnostic, "code")) });
+        return if (outcome.status == .cancelled) error.Canceled else error.WorkerCommandFailed;
+    }
+    return outcome;
+}
+
+fn model(self: *Self) agent.Model {
+    var config = self.provider.modelConfig(self.system_prompt);
+    config.max_output_tokens = self.settings.max_output_tokens;
+    config.reasoning_effort = self.settings.reasoning_effort orelse "none";
+    return config;
+}
+
+fn openWorker(self: *Self, path: ?[]const u8) !agent.Worker {
+    var actual = path orelse "memory:";
+    var seed: ?agent.conversation.Import = null;
+    if (path) |source| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, source, self.a, .limited(256 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => "",
+            else => return err,
+        };
+        if (bytes.len > 0 and bytes[0] == '{') {
+            const source_lock = try std.Io.Dir.cwd().openFile(self.io, source, .{ .lock = .shared, .lock_nonblocking = true });
+            defer source_lock.close(self.io);
+            seed = try Session.legacy(self.a, self.io, source);
+            actual = try std.fmt.allocPrint(self.a, "{s}.worker.gz", .{source});
+        }
+    }
+    var adapters = self.effects.adapters();
+    adapters.rpc = .{ .context = self, .call = rpc };
+    var nonce: [16]u8 = undefined;
+    self.io.random(&nonce);
+    const ephemeral_id = std.fmt.bytesToHex(nonce, .lower);
+    var journal_digest: [32]u8 = undefined;
+    const session_id: []const u8 = if (path != null) blk: {
+        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, ".", self.a);
+        const absolute = try std.fs.path.resolve(self.a, &.{ cwd, actual });
+        std.crypto.hash.sha2.Sha256.hash(absolute, &journal_digest, .{});
+        break :blk try self.a.dupe(u8, &std.fmt.bytesToHex(journal_digest, .lower));
+    } else &ephemeral_id;
+    var worker = try agent.Worker.open(self.gpa, self.io, .{
+        .session_id = session_id,
+        .journal_path = actual,
+        .persistence = if (path == null) .memory else .journal,
+        .workspace = self.settings.workspace,
+        .model = self.model(),
+        .limits = .{ .max_record_bytes = 32 * 1024 * 1024, .max_journal_bytes = 1024 * 1024 * 1024, .max_records = 100000, .max_response_bytes = 16 * 1024 * 1024, .max_vm_bytes = 128 * 1024 * 1024, .max_rounds = 128 },
+        .tools = try @import("coding_tools.zig").definitions(self.a),
+        .tool_grants = &.{ "coding.read", "coding.edit", "coding.write", "coding.bash.prepare", "process.exec", "coding.bash.result" },
+        .adapters = adapters,
+        .observer = .{ .context = self, .notify = observe },
+    });
+    errdefer worker.deinit();
+    if (seed) |imported| {
+        const request = try worker.submit("legacy-import-v1", .{ .import_conversation = imported });
+        defer request.deinit();
+        var result = try request.wait(self.io);
+        defer result.deinit();
+        if (result.status != .completed) return error.LegacyImportFailed;
+        const receipt = try std.fmt.allocPrint(self.a, "{s}.migration.json", .{path.?});
+        const pending = try std.fmt.allocPrint(self.a, "{s}.{s}.pending", .{ receipt, ephemeral_id });
+        const file = try std.Io.Dir.cwd().createFile(self.io, pending, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer file.close(self.io);
+        try file.writePositionalAll(self.io, try j.encode(self.a, .{ .source = path.?, .destination = actual, .request_id = "legacy-import-v1" }), 0);
+        try file.sync(self.io);
+        try std.Io.Dir.rename(.cwd(), pending, .cwd(), receipt, self.io);
+        var directory = try std.Io.Dir.cwd().openDir(self.io, std.fs.path.dirname(receipt) orelse ".", .{ .iterate = true });
+        defer directory.close(self.io);
+        while (true) switch (std.posix.errno(std.posix.system.fsync(directory.handle))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.MigrationReceiptSyncFailed,
+        };
+    }
+    return worker;
+}
+
+fn rpc(raw: ?*anyopaque, a: std.mem.Allocator, io: std.Io, request: agent.AdapterRequest) !agent.AdapterResponse {
+    const self: *Self = @ptrCast(@alignCast(raw.?));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temporary = arena.allocator();
+    const packet = try j.parse(temporary, request.json);
+    const endpoint = j.text(j.get(packet, "endpoint"));
+    const value = try self.registry.dispatch(.{ .allocator = temporary, .io = io, .idempotency_key = j.text(j.get(packet, "idempotency_key")) }, endpoint, j.get(packet, "arguments"));
+    if (std.mem.startsWith(u8, endpoint, "coding.") and !std.mem.eql(u8, endpoint, "coding.bash.prepare")) try self.admitSteering();
+    return .{ .json = try j.encode(a, value) };
+}
+
+fn observe(raw: ?*anyopaque, notice: agent.Notice) !void {
+    const self: *Self = @ptrCast(@alignCast(raw.?));
+    var arena = std.heap.ArenaAllocator.init(self.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const payload = try j.parse(a, notice.json);
+    switch (notice.kind) {
+        .conversation_committed => for (j.items(j.get(payload, "entries"))) |entry| {
+            const kind = j.text(j.get(entry, "kind"));
+            if (std.mem.eql(u8, kind, "input")) try self.emit(.{ .kind = .user, .text = j.text(j.get(entry, "text")) });
+            if (std.mem.eql(u8, kind, "response")) {
+                try self.emit(.{ .kind = .assistant, .text = j.text(j.get(entry, "text")) });
+                const thinking = j.text(j.get(entry, "thinking"));
+                if (thinking.len > 0) try self.emit(.{ .kind = .thinking, .text = thinking });
+                const usage = j.get(entry, "usage");
+                if (j.number(j.get(usage, "total_tokens")) > 0) self.context_tokens.store(j.number(j.get(usage, "total_tokens")), .release);
+            }
+        },
+        .tool_started, .tool_finished => {
+            const endpoint = j.text(j.get(payload, "endpoint"));
+            const start = notice.kind == .tool_started;
+            const failed = j.get(payload, "failed");
+            if (!start and std.mem.eql(u8, endpoint, "process.exec") and failed == .bool and failed.bool) {
+                const message = "Interrupted before a tool result was recorded. Inspect the current state before repeating the operation.";
+                const interrupted = try j.value(a, .{ .content = .{.{ .type = "text", .text = message }}, .isError = true });
+                try self.emit(.{ .kind = .tool_end, .name = j.text(j.get(payload, "tool_name")), .text = message, .data = interrupted });
+                return;
+            }
+
+            const direct = std.mem.eql(u8, endpoint, "coding.read") or std.mem.eql(u8, endpoint, "coding.edit") or std.mem.eql(u8, endpoint, "coding.write");
+            if (!direct and !(start and std.mem.eql(u8, endpoint, "coding.bash.prepare")) and !(!start and std.mem.eql(u8, endpoint, "coding.bash.result"))) return;
+            const result = j.get(payload, "result");
+            try self.emit(.{ .kind = if (start) .tool_start else .tool_end, .name = j.text(j.get(payload, "tool_name")), .data = if (start) j.get(payload, "arguments") else result, .text = if (start) "" else try compaction.textContent(a, j.get(result, "content")) });
+        },
+        else => {},
+    }
+}
+
+fn refresh(self: *Self) !void {
+    var snapshot = try self.worker.?.readConversation(self.gpa);
+    defer snapshot.deinit();
+    self.context_tokens.store(snapshot.context_tokens, .release);
+    const path = self.session.path;
+    _ = self.view_arena.reset(.retain_capacity);
+    self.session = try Session.view(self.view_arena.allocator(), snapshot, path);
+}
+
+pub fn run(self: *Self, text: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(self.gpa);
+    defer arena.deinit();
+    try self.runPrepared(try self.prepare(arena.allocator(), text));
+}
+
+pub fn runPrepared(self: *Self, input: Prepared) !void {
+    errdefer self.cancel();
+    self.stop.store(false, .release);
+    self.steering_mutex.lockUncancelable(self.io);
+    self.admission = .running;
+    self.steering_mutex.unlock(self.io);
+    defer {
+        self.steering_mutex.lockUncancelable(self.io);
+        self.admission = .closed;
+        self.steering_mutex.unlock(self.io);
+        const protection = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(protection);
+        self.refresh() catch {};
+    }
+    var next_input: agent.conversation.Run = .{ .input = .{ .text = input.text }, .model = self.model(), .context_ceiling = self.settings.context_window - self.settings.reserve_tokens };
+    var recovered = false;
+    while (true) {
+        if (self.stop.load(.acquire)) return error.Canceled;
+        var outcome = try self.execute(.{ .run = next_input });
+        defer outcome.deinit();
+        try self.refresh();
+        if (outcome.boundary()) |boundary| {
+            if (boundary.cause == .provider_overflow and recovered) return error.ContextOverflow;
+            if (boundary.cause == .provider_overflow) recovered = true;
+            try self.compactInner("");
+            next_input.input = .{ .continuation = try self.a.dupe(u8, boundary.continuation) };
+            continue;
+        }
+        self.steering_mutex.lockUncancelable(self.io);
+        if (self.steering.items.len == 0) {
+            self.admission = .closed;
+            self.steering_mutex.unlock(self.io);
+            break;
+        }
+        const pending = self.steering.orderedRemove(0);
+        self.steering_mutex.unlock(self.io);
+        next_input.input = .{ .text = try self.a.dupe(u8, pending.text) };
+        self.gpa.free(pending.text);
+        self.gpa.free(pending.original);
+    }
+    if (self.contextTokens() > self.settings.context_window - self.settings.reserve_tokens) self.compactInner("") catch |err| switch (err) {
+        error.NothingToCompact => {},
+        else => return err,
+    };
+}
+
+pub fn compact(self: *Self, instructions: []const u8) !void {
+    self.stop.store(false, .release);
+    try self.compactInner(instructions);
+}
+
+fn summaryPart(self: *Self, a: std.mem.Allocator, entries: []const *Session.Entry, previous: ?[]const u8, focus: []const u8, prefix: bool) !agent.conversation.SummaryPart {
+    _ = self;
+    const serialized = try compaction.conversation(a, entries);
+    var text = if (prefix)
+        try std.fmt.allocPrint(a, "# Conversation\n{s}\n\n# Instructions\n{s}", .{ serialized, prompts.turn_prefix })
+    else if (previous) |summary|
+        try std.fmt.allocPrint(a, "<conversation>\n{s}\n</conversation>\n\n<previous-summary>\n{s}\n</previous-summary>\n\n{s}", .{ serialized, summary, prompts.update_summary })
+    else
+        try std.fmt.allocPrint(a, "<conversation>\n{s}\n</conversation>\n\n{s}", .{ serialized, prompts.summary });
+    if (focus.len > 0) text = try std.fmt.allocPrint(a, "{s}\n\nAdditional focus: {s}", .{ text, focus });
+    return .{ .generate = .{ .instructions = prompts.summary_system, .input = text } };
+}
+
+fn compactInner(self: *Self, focus: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(self.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try self.refresh();
+    const projection = try self.session.visible(a);
+    const point = compaction.cut(projection.entries, self.settings.keep_recent_tokens) orelse return error.NothingToCompact;
+    const before = self.contextTokens();
+    try self.emit(.{ .kind = .compacting, .tokens = before });
+    const previous: ?[]const u8 = if (projection.summary) |entry| j.text(j.get(entry.payload, "summary")) else null;
+    const history_end = point.turn_start orelse point.index;
+    var parts: std.ArrayList(agent.conversation.SummaryPart) = .empty;
+    if (history_end > 0) try parts.append(a, try self.summaryPart(a, projection.entries[0..history_end], previous, focus, false)) else try parts.append(a, .{ .literal = previous orelse "No prior history." });
+    if (point.turn_start) |start| {
+        try parts.append(a, .{ .literal = "\n\n---\n\n**Turn Context (split turn):**\n\n" });
+        try parts.append(a, try self.summaryPart(a, projection.entries[start..point.index], null, focus, true));
+    }
+    var files = try compaction.Files.init(a, projection.summary);
+    try files.collect(a, projection.entries[0..point.index]);
+    const lists = try files.lists(a);
+    for ([_]struct { tag: []const u8, paths: []const []const u8 }{ .{ .tag = "read-files", .paths = lists.readFiles }, .{ .tag = "modified-files", .paths = lists.modifiedFiles } }) |group| {
+        if (group.paths.len > 0) try parts.append(a, .{ .literal = try std.fmt.allocPrint(a, "\n\n<{s}>\n{s}\n</{s}>", .{ group.tag, try std.mem.join(a, "\n", group.paths), group.tag }) });
+    }
+    var snapshot = try self.worker.?.readConversation(a);
+    defer snapshot.deinit();
+    const old = self.summarizing;
+    self.summarizing = true;
+    defer self.summarizing = old;
+    var outcome = try self.execute(.{ .compact = .{ .expected_revision = snapshot.revision, .first_kept = projection.entries[point.index].id, .parts = parts.items, .model = self.model(), .metadata = try j.value(a, .{ .tokensBefore = before, .details = lists }) } });
+    defer outcome.deinit();
+    try self.refresh();
+    try self.emit(.{ .kind = .compacted, .text = outcome.text(), .tokens = self.contextTokens() });
+}
+
+pub fn history(self: *Self, a: std.mem.Allocator) ![]Event {
+    var events: std.ArrayList(Event) = .empty;
+    for (try self.session.branch(a)) |entry| switch (entry.kind) {
+        .user => try events.append(a, .{ .kind = .user, .text = j.text(j.get(entry.payload, "text")) }),
+        .assistant => try events.append(a, .{ .kind = .assistant, .text = try compaction.assistantText(a, j.get(entry.payload, "output")) }),
+        .tool => {
+            const observations = j.items(j.get(entry.payload, "observations"));
+            for (observations) |observation| {
+                const endpoint = j.text(j.get(observation, "endpoint"));
+                if (!std.mem.eql(u8, endpoint, "coding.read") and !std.mem.eql(u8, endpoint, "coding.edit") and !std.mem.eql(u8, endpoint, "coding.write") and !std.mem.eql(u8, endpoint, "coding.bash.result") and !std.mem.eql(u8, endpoint, "legacy")) continue;
+                const result = j.get(observation, "result");
+                try events.append(a, .{ .kind = .tool_end, .name = j.text(j.get(observation, "name")), .data = try j.value(a, .{ .result = result, .arguments = j.get(observation, "arguments") }), .text = try compaction.textContent(a, j.get(result, "content")) });
+            }
+            if (observations.len == 0) try events.append(a, .{ .kind = .tool_end, .name = "execute_lua", .data = entry.payload, .text = try compaction.textContent(a, j.get(j.get(entry.payload, "result"), "content")) });
+        },
+        .compaction => try events.append(a, .{ .kind = .compacted, .text = j.text(j.get(entry.payload, "summary")), .tokens = j.number(j.get(entry.payload, "tokensBefore")) }),
+        .branch => {},
+    };
+    return events.items;
+}

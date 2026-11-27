@@ -1,0 +1,287 @@
+[
+  {
+    "commands": [
+      {
+        "keystrokes": "pwd\n",
+        "duration": 0.1
+      }
+    ],
+    "is_task_complete": false,
+    "error": "",
+    "warning": "",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [
+      {
+        "keystrokes": "pwd\n",
+        "duration": 0.1
+      }
+    ],
+    "is_task_complete": false,
+    "error": "",
+    "warning": "- Extra text detected before JSON object\n- Extra text detected after JSON object",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [
+      {
+        "keystrokes": "pwd\n",
+        "duration": 0.1
+      }
+    ],
+    "is_task_complete": false,
+    "error": "",
+    "warning": "- AUTO-CORRECTED: Fixed incomplete JSON by adding missing closing brace - please fix this in future responses",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [],
+    "is_task_complete": false,
+    "error": "Missing required fields: analysis, plan, commands",
+    "warning": "",
+    "analysis": "",
+    "plan": ""
+  },
+  {
+    "commands": [],
+    "is_task_complete": false,
+    "error": "Invalid JSON: SyntaxError",
+    "warning": "",
+    "analysis": "",
+    "plan": ""
+  },
+  {
+    "commands": [],
+    "is_task_complete": false,
+    "error": "",
+    "warning": "",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [],
+    "is_task_complete": false,
+    "error": "Field 'commands' must be an array",
+    "warning": "",
+    "analysis": "",
+    "plan": ""
+  },
+  {
+    "commands": [],
+    "is_task_complete": true,
+    "error": "",
+    "warning": "- Command 1 missing required 'keystrokes' field",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [],
+    "is_task_complete": false,
+    "error": "Command 1 missing required 'keystrokes' field",
+    "warning": "",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [
+      {
+        "keystrokes": "",
+        "duration": 0.1
+      }
+    ],
+    "is_task_complete": false,
+    "error": "",
+    "warning": "",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [
+      {
+        "keystrokes": "pwd",
+        "duration": 0.0
+      },
+      {
+        "keystrokes": "\n",
+        "duration": 0.0
+      }
+    ],
+    "is_task_complete": false,
+    "error": "",
+    "warning": "- Command 1 should end with newline when followed by another command. Otherwise the two commands will be concatenated together on the same line.",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [
+      {
+        "keystrokes": "pwd",
+        "duration": 1.0
+      }
+    ],
+    "is_task_complete": false,
+    "error": "",
+    "warning": "",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [
+      {
+        "keystrokes": "pwd",
+        "duration": 1.0
+      }
+    ],
+    "is_task_complete": false,
+    "error": "",
+    "warning": "- Command 1: Invalid duration value, using default 1.0",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [
+      {
+        "keystrokes": "pwd",
+        "duration": 1.0
+      }
+    ],
+    "is_task_complete": false,
+    "error": "",
+    "warning": "- Command 1: Missing duration field, using default 1.0",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [],
+    "is_task_complete": false,
+    "error": "Command 1 must be an object",
+    "warning": "",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [
+      {
+        "keystrokes": "pwd\n",
+        "duration": 0.1
+      }
+    ],
+    "is_task_complete": false,
+    "error": "",
+    "warning": "- Field 'analysis' should be a string\n- Field 'plan' should be a string",
+    "analysis": 12,
+    "plan": false
+  },
+  {
+    "commands": [
+      {
+        "keystrokes": "pwd\n",
+        "duration": 0.1
+      }
+    ],
+    "is_task_complete": true,
+    "error": "",
+    "warning": "",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [
+      {
+        "keystrokes": "pwd\n",
+        "duration": 0.1
+      }
+    ],
+    "is_task_complete": true,
+    "error": "",
+    "warning": "- Field 'task_complete' should be a boolean or string",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [],
+    "is_task_complete": false,
+    "error": "",
+    "warning": "- Fields appear in wrong order. Found: commands \u2192 plan \u2192 analysis, expected: analysis \u2192 plan \u2192 commands",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [
+      {
+        "keystrokes": "\"\\\n\u2603",
+        "duration": -1.0
+      }
+    ],
+    "is_task_complete": false,
+    "error": "",
+    "warning": "- Command 1: Unknown fields: extra",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [
+      {
+        "keystrokes": "pwd\n",
+        "duration": 0.1
+      }
+    ],
+    "is_task_complete": false,
+    "error": "",
+    "warning": "- AUTO-CORRECTED: Extracted JSON from mixed content - please fix this in future responses",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [],
+    "is_task_complete": false,
+    "error": "Command 1 must be an object",
+    "warning": "",
+    "analysis": "a",
+    "plan": "p"
+  },
+  {
+    "commands": [],
+    "is_task_complete": false,
+    "error": "No valid JSON found in response",
+    "warning": "- No valid JSON object found",
+    "analysis": "",
+    "plan": ""
+  },
+  {
+    "commands": [],
+    "is_task_complete": false,
+    "error": "No valid JSON found in response",
+    "warning": "- No valid JSON object found",
+    "analysis": "",
+    "plan": ""
+  },
+  {
+    "commands": [],
+    "is_task_complete": false,
+    "error": "No valid JSON found in response",
+    "warning": "- No valid JSON object found",
+    "analysis": "",
+    "plan": ""
+  },
+  {
+    "commands": [],
+    "is_task_complete": false,
+    "error": "No valid JSON found in response",
+    "warning": "- No valid JSON object found",
+    "analysis": "",
+    "plan": ""
+  },
+  {
+    "commands": [],
+    "is_task_complete": false,
+    "error": "Invalid JSON: SyntaxError",
+    "warning": "- Extra text detected before JSON object\n- Extra text detected after JSON object",
+    "analysis": "",
+    "plan": ""
+  }
+]

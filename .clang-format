@@ -1,0 +1,7 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+BreakBeforeBraces: Linux
+ColumnLimit: 100
+AllowShortEnumsOnASingleLine: false
+BinPackArguments: false
+BinPackParameters: false

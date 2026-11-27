@@ -1,0 +1,23 @@
+.{
+    .name = .luau,
+    .version = "0.0.1",
+    .dependencies = .{
+        .upstream = .{
+            .url = "git+https://github.com/luau-lang/luau#32c28089305f488f901aaf1dbf3fd1cb65fa3d11",
+            .hash = "N-V-__8AAN6UJAHIe8MUMpWjpoqaPSyJjTjgdhzFJbcMgojH",
+        },
+    },
+    .minimum_zig_version = "0.17.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "sources.zig",
+        "include",
+        "src",
+        "tests",
+        "examples",
+        "repl_example.zig",
+        "README.md",
+    },
+    .fingerprint = 0x5e07e24920c30dfb,
+}

@@ -1,0 +1,25 @@
+.{
+    .name = .ghostmux,
+    .version = "0.0.1",
+    .dependencies = .{
+        .ghostty = .{
+            .url = "git+https://github.com/ghostty-org/ghostty#b2c78c9bd9bc88a16d9c3769b0fb17ddde1b78b1",
+            .hash = "ghostty-1.4.1-dev-5UdBC2n3hwUv6wB8nxuvpl9M8uussV2WYbTbpRe2gIbC",
+        },
+        .kb = .{
+            .url = "https://github.com/JimmyLefevre/kb/archive/b07373d.tar.gz",
+            .hash = "N-V-__8AAIHtGgAmKB0bXFdp25Ts4C9jGTH6NvuEJ9omP9sa",
+        },
+        .stb = .{
+            .url = "https://github.com/nothings/stb/archive/2c980bb59875b0d32144a71867fbdebb2f77cd20.tar.gz",
+            .hash = "N-V-__8AAPJDTgBMvhz_RoGlqYS1cMahRQ6Q5GVqYKny36gQ",
+        },
+        .kit = .{
+            .url = "git+https://forge.bc3.moe/bob/Kit.zig#24f6742702cf7a5906d8c5f8a4dd4aaf28aac341",
+            .hash = "kit-0.0.0-1RjPzrdxTAB84D1BAsFQ-3htf5ZALOlm7O1Ls1kPj5xa",
+        },
+    },
+    .minimum_zig_version = "0.17.1",
+    .paths = .{""},
+    .fingerprint = 0xe84148dc17c69b95,
+}

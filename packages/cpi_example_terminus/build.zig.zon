@@ -1,0 +1,12 @@
+.{
+    .name = .cpi_example_terminus,
+    .fingerprint = 0x1b75de58ef283aaa,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .agent = .{ .path = "../agent" },
+        .services = .{ .path = "../services" },
+        .ghostmux = .{ .path = "../ghostmux" },
+    },
+    .paths = .{""},
+}

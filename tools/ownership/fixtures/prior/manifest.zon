@@ -1,0 +1,17 @@
+.{
+    .revision = "01ca874da1e0f2eb8415e1b2b51f8975231d47da",
+    .files = .{
+        .{
+            .fixture = "domain_ops.zig",
+            .source = "packages/agent/src/domain_ops.zig",
+            .sha256 = "680fac93d80e5bd338bab22bb90be711b50d265d3ada08ebed15197d75a6d4e2",
+            .expected = .{.{ .rule = "OWN001", .line = 128, .column = 11 }},
+        },
+        .{
+            .fixture = "logic.zig",
+            .source = "packages/agent/src/logic.zig",
+            .sha256 = "31a42d5946196ba60637cfa9f52fc67aa9eb235fb51297d1a221a7d3820e2839",
+            .expected = .{.{ .rule = "OWN002", .line = 163, .column = 19 }},
+        },
+    },
+}

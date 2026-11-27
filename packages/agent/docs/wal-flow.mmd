@@ -1,0 +1,15 @@
+flowchart TD
+    A[Owned candidate] --> B[Prepare commit]
+    B --> C{Retained limits}
+    C -->|Fit| D[Append and sync]
+    C -->|Replace| E[Write and sync checkpoint]
+    E --> F[Rename and sync directory]
+    D -->|Success| G[Install and publish]
+    F -->|Success| G
+    G --> H[Dispatch or resume]
+    D -->|Failure| X[Keep first cause]
+    E -->|Failure| X
+    F -->|Failure| X
+    X --> Y[Settle before join]
+    R[Pure reconstruction] --> I[Recovery candidate]
+    I --> A

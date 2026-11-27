@@ -1,0 +1,115 @@
+const std = @import("std");
+
+fn configure(module: *std.Build.Module, b: *std.Build, target: std.Build.ResolvedTarget, kb: *std.Build.Dependency, stb: *std.Build.Dependency) void {
+    module.addAnonymousImport("fonts", .{ .root_source_file = b.path("fonts/assets.zig") });
+    module.addIncludePath(b.path("src"));
+    if (target.result.os.tag == .linux or target.result.os.tag == .freebsd or target.result.os.tag == .netbsd or target.result.os.tag == .openbsd or target.result.os.tag == .dragonfly) module.linkSystemLibrary("util", .{});
+    if (target.result.os.tag == .windows) {
+        module.linkSystemLibrary("kernel32", .{});
+        module.linkSystemLibrary("advapi32", .{});
+    }
+    module.addIncludePath(kb.path(""));
+    module.addIncludePath(stb.path(""));
+    const bindings = b.addTranslateC(.{
+        .root_source_file = b.path("src/font_engine.h"),
+        .target = target,
+        .optimize = module.optimize.?,
+    });
+    bindings.addIncludePath(kb.path(""));
+    bindings.addIncludePath(stb.path(""));
+    module.addImport("font_bindings", bindings.createModule());
+    module.addCSourceFile(.{ .file = b.path("src/font_engine.c"), .flags = &.{"-std=c23"} });
+}
+
+pub fn build(b: *std.Build) void {
+    var target = b.standardTargetOptions(.{});
+    if (target.result.os.tag == .windows) {
+        if (target.query.os_version_min == null) {
+            var query = target.query;
+            query.os_version_min = .{ .windows = .win10_rs5 };
+            target = b.resolveTargetQuery(query);
+        } else if (@backingInt(target.result.os.version_range.windows.min) < @backingInt(std.Target.Os.WindowsVersion.win10_rs5)) {
+            std.debug.panic("ghostmux requires Windows 10 RS5 or newer", .{});
+        }
+    }
+    const optimize = b.standardOptimizeOption(.{});
+    const kit = b.dependency("kit", .{ .target = target, .optimize = optimize });
+    const json_text = b.createModule(.{
+        .root_source_file = b.path("../json_tree/text.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "kit", .module = kit.module("kit") }},
+    });
+    // Debug Ghostty performs exhaustive page validation during ingestion.
+    // Keep ordinary runtime safety without those repeated diagnostic scans.
+    const terminal_optimize: std.lang.Optimize = if (optimize == .debug) .safe else optimize;
+    const ghostty = b.dependency("ghostty", .{ .target = target, .optimize = terminal_optimize, .simd = false, .@"emit-lib-vt" = true, .@"vt-features" = "-all,+render-state" });
+    const kb = b.dependency("kb", .{});
+    const stb = b.dependency("stb", .{});
+    const executable = b.addExecutable(.{
+        .name = "ghostmux",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") }},
+        }),
+    });
+    configure(executable.root_module, b, target, kb, stb);
+    executable.root_module.addImport("json_text", json_text);
+    b.installArtifact(executable);
+    const tests = b.addTest(.{
+        .filters = if (b.option([]const u8, "test-filter", "Run matching tests")) |filter| &.{filter} else &.{},
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/native_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") }},
+        }),
+    });
+    configure(tests.root_module, b, target, kb, stb);
+    tests.root_module.addImport("json_text", json_text);
+    const test_options = b.addOptions();
+    const Program = @import("src/test_child.zig").Program;
+    inline for (comptime std.meta.tags(Program)) |program| {
+        const posix = switch (program) {
+            .signals, .family, .family_exit, .echo, .queries => true,
+            else => false,
+        };
+        if (target.result.os.tag == .windows and posix) {
+            test_options.addOption([]const u8, @tagName(program), "");
+        } else {
+            const child_options = b.addOptions();
+            child_options.addOption(Program, "program", program);
+            const test_child = b.addExecutable(.{
+                .name = "ghostmux-test-" ++ @tagName(program),
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/test_child.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                }),
+            });
+            test_child.root_module.addOptions("child_options", child_options);
+            test_options.addOptionPath(@tagName(program), test_child.getEmittedBin());
+        }
+    }
+    test_options.addOptionPath("binary", executable.getEmittedBin());
+    test_options.addOption([]const u8, "project", std.process.currentPathAlloc(b.graph.io, b.allocator) catch @panic("cannot resolve test working directory"));
+    tests.root_module.addImport("test_options", test_options.createModule());
+    const run_tests = b.addRunArtifact(tests);
+    run_tests.setCwd(.cache_root);
+    b.step("test", "Run tests").dependOn(&run_tests.step);
+    for ([_][]const u8{ "THIRD_PARTY_NOTICES.md", "fonts/OFL.txt", "fonts/LICENSE-nerd-fonts.txt", "fonts/ATTRIBUTIONS-nerd-fonts.md", "fonts/MANIFEST.sha256" }) |path| {
+        b.installFile(path, b.fmt("share/ghostmux/{s}", .{path}));
+    }
+    inline for (.{ ghostty, kb, stb }, .{ "ghostty", "kb", "stb" }) |dependency, name| {
+        const license = b.addInstallFile(dependency.path("LICENSE"), "share/ghostmux/LICENSE-" ++ name);
+        b.getInstallStep().dependOn(&license.step);
+    }
+    const run = b.addRunArtifact(executable);
+    run.addPassthruArgs();
+    b.step("run", "Run ghostmux").dependOn(&run.step);
+}

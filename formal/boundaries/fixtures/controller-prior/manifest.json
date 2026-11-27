@@ -1,0 +1,20 @@
+{
+  "revision": "ca76e6e3847ace2ac1fa482f72078cd07e8a6967",
+  "files": [
+    {
+      "source": "packages/cpi_minimal/src/Controller.zig",
+      "fixture": "minimal-controller.zig.txt",
+      "sha256": "29e1966afe27672cf4a32596e70076694f2088328589d7a5df42b95eebeb6f3c"
+    },
+    {
+      "source": "packages/agent/examples/chat.zig",
+      "fixture": "chat.zig.txt",
+      "sha256": "55a7024ca93f95c2287c91ef92bf4f1b42bff3b41c84a83ac86943d07d7aae0f"
+    },
+    {
+      "source": "packages/agent/examples/effects.zig",
+      "fixture": "effects.zig.txt",
+      "sha256": "4e3be627c62579b2c7ea6d165ab06ea1b32f45799728d70da83b328010d301da"
+    }
+  ]
+}

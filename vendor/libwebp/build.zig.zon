@@ -1,0 +1,13 @@
+.{
+    .name = .libwebp,
+    .version = "1.6.0",
+    .minimum_zig_version = "0.17.1",
+    .fingerprint = 0xa2496aa758452f9c,
+    .dependencies = .{
+        .upstream = .{
+            .url = "git+https://github.com/webmproject/libwebp#4fa21912338357f89e4fd51cf2368325b59e9bd9",
+            .hash = "N-V-__8AAEIyewDs-Qt2FWog6ZRUCvQm_27MKKOfSk54_teC",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon" },
+}

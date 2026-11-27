@@ -1,0 +1,19 @@
+.{
+    .name = .cpi2,
+    .version = "0.0.1",
+    .dependencies = .{
+        .json_tree = .{ .path = "packages/json_tree" },
+        .agent = .{ .path = "packages/agent" },
+        .dotenv = .{ .path = "packages/dotenv" },
+        .model_registry = .{ .path = "packages/model_registry" },
+        .mcp = .{ .path = "packages/mcp" },
+        .luau = .{ .path = "vendor/luau" },
+        .ghostmux = .{ .path = "packages/ghostmux" },
+        .services = .{ .path = "packages/services" },
+        .cpi_example_terminus = .{ .path = "packages/cpi_example_terminus" },
+        .cpi_minimal = .{ .path = "packages/cpi_minimal" },
+    },
+    .minimum_zig_version = "0.17.1",
+    .paths = .{""},
+    .fingerprint = 0x20ce6ecfd8917c78,
+}

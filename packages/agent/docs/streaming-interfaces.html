@@ -1,0 +1,418 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Streaming: exact Zig interfaces</title><style>:root{color-scheme:light dark;--paper:light-dark(#f7f4e8,#0c0c0e);--ink:light-dark(#0c1115,#f7f4e8);--line:light-dark(#0c1115,#736c82);--band:light-dark(#d8d2f2,#25232c);--code:light-dark(#e7e1cf,#25232c);--link:light-dark(#514a86,#d2cbf0)}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 "Public Sans",system-ui,sans-serif}main{max-width:900px;margin:24px auto;padding:24px}header{padding:16px 20px;background:var(--band);border:2px solid var(--line);border-left:8px solid #f2c9d9}h1,h2{font-family:"Chivo",system-ui,sans-serif}h1{font-size:32px;margin:0 0 8px}h2{font-size:19px;margin:18px 0 6px}p{margin:0 0 10px}pre{font:12px/1.45 "JetBrains Mono",ui-monospace,monospace;overflow-x:auto;background:var(--code);border-left:3px solid var(--link);padding:12px;margin:10px 0}table{width:100%;border-collapse:collapse;margin:10px 0;font-size:13px}th,td{text-align:left;vertical-align:top;padding:5px 7px;border-bottom:1px solid var(--line)}th{background:var(--band)}td code{font-size:11px;overflow-wrap:anywhere}a{color:var(--link)}footer{border-top:1px solid var(--line);margin-top:16px;padding-top:12px;font-size:13px}@media(max-width:600px){main{margin:0;padding:16px}}@page{size:A4;margin:16mm}@media print{body{font-size:11pt;line-height:1.3}main{max-width:none;margin:0;padding:0}header{padding:9px 12px}h1{font-size:23pt}h2{font-size:13pt;margin-top:12px;break-after:avoid}pre{font-size:9pt;padding:8px}p{orphans:2;widows:2}section{break-inside:avoid}footer{font-size:9pt}}pre{font-size:13px}section{padding-bottom:14px;border-bottom:1px solid var(--line)}h3{font-size:16px}code{overflow-wrap:anywhere}pre code{overflow-wrap:normal}nav{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0}</style></head><body><main><header><h1>Streaming interfaces</h1><p>Exact per-file declarations and ownership contracts for the planned Zig implementation. No runtime modules have been added yet.</p></header>
+<p class="status">Session redesign status. The <a href="session-frames.md">linear frame-log draft</a> supersedes snapshot/delta persistence and registry-revision request views as the target architecture. This page retains the earlier storage or streaming design for reference. It is not a specification of the new frame reducer.</p><nav><a href="#scope">Files</a><a href="#ModelResult">Result</a><a href="#SseDecoder">SSE</a><a href="#ResponsesDecoder">Provider</a><a href="#ModelStream">Stream</a><a href="#EventOutbox">Outbox</a><a href="#ProgressBatch">Batch</a><a href="#Worker">Worker</a><a href="#io">I/O</a><a href="#model">Model</a><a href="#helpers">Helpers</a><a href="#bridge">Bridge</a><a href="#sequence">Order</a></nav><section id="scope"><h2>Change set</h2>
+<p>These declarations define the planned API. They omit bodies and private fields but include every parameter and return type. Each owner file uses <code>const Self = @This()</code>. Common aliases are <code>Allocator = std.mem.Allocator</code>, <code>j = @import("json.zig")</code>, and <code>api = @import("abi")</code>. Type names from other files refer to imports of those files.</p>
+<table><tr><th>Action</th><th>Files</th></tr>
+<tr><td>Add state owners</td><td>SseDecoder.zig, ResponsesDecoder.zig, ModelStream.zig, ProgressBatch.zig, EventOutbox.zig, ModelResult.zig</td></tr>
+<tr><td>Add pure helper</td><td>abi_bytes.zig</td></tr>
+<tr><td>Change</td><td>Worker.zig, io.zig, model.zig, responses.zig, json.zig, logic.zig, work.zig, c_api.zig</td></tr>
+<tr><td>Remove</td><td>events.zig: move its private Event storage into EventOutbox and its byte-view helpers into abi_bytes.</td></tr>
+<tr><td>Unchanged</td><td>root.zig, vm.zig and native VM files, extension sources, Kit/Luau dependencies. Relative imports require no new build module.</td></tr></table>
+<p>No generic stream interface, provider-dispatch vtable, callback, thread, or coroutine is introduced. Only Worker-facing helpers import Worker.</p>
+<p>Worker validates limit relationships before constructing the owners. The Error sets below include all parser errors. Existing orchestration functions retain anyerror for storage and legacy failures. Return values distinguish expected input, capacity, and protocol outcomes.</p>
+</section>
+<section id="ModelResult"><h2>Add ModelResult.zig</h2>
+<p>Owns one validated final response and its request identity. It replaces <code>responses.Response</code> without a separate Completion wrapper.</p>
+<pre><code>pub const Origin = struct {
+    request_id: []const u8,
+    generation: u64,
+    operation_id: u64,
+    capabilities_revision: u64,
+};
+
+pub const Identity = struct {
+    allocator: Allocator,
+    value: Origin,
+    pub fn init(allocator: Allocator, value: Origin) Allocator.Error!Identity;
+    pub fn deinit(self: *Identity) void;
+};
+
+pub const Body = enum { root, response };
+pub const Limits = struct {
+    max_calls: u32,
+    max_arguments_bytes: usize,
+    max_source_bytes: usize,
+};
+pub const Error = Allocator.Error || error{
+    InvalidResponse, Incomplete, ProviderFailed, Refused,
+    InvalidCall, DuplicateCall, LimitExceeded,
+};
+pub const Call = struct {
+    call_id: []const u8,
+    name: []const u8,
+    arguments: []const u8,
+};
+pub const CallIterator = struct {
+    output: []const j.Value,
+    index: usize = 0,
+    pub fn next(self: *CallIterator) ?Call;
+};
+
+pub fn take(
+    identity: *?Identity,
+    document: *?j.Document,
+    body: Body,
+    limits: Limits,
+) Error!Self;
+pub fn deinit(self: *Self) void;
+pub fn origin(self: *const Self) Origin;
+pub fn model(self: *const Self) []const u8;
+pub fn output(self: *const Self) j.Value;
+pub fn usage(self: *const Self) j.Value;
+pub fn calls(self: *const Self) CallIterator;
+pub fn publicValue(self: *const Self, allocator: Allocator) Allocator.Error!j.Value;</code></pre>
+<p><code>Identity.init</code> copies request_id. Its other fields are scalars. Identity owns memory and must not be copied. <code>take</code> validates first, then consumes and nulls both optionals on success. On error, the caller retains ownership of both. Body.root selects buffered JSON. Body.response selects the response field of a terminal SSE event. deinit frees the identity and document.</p>
+<p>Accessors and CallIterator return views valid until result deinit. publicValue allocates its values in the supplied allocator. It includes the generation, provider response ID, model, usage, public message output, and function-call output. It excludes reasoning and opaque private items. output retains every original item for model replay. The result needs no separate answer buffer or copied call-string array.</p>
+</section>
+<section id="SseDecoder"><h2>Add SseDecoder.zig</h2>
+<p>Owns framing state and incomplete bytes. It does not parse JSON.</p>
+<pre><code>pub const Limits = struct {
+    max_frame_bytes: usize,
+    max_line_bytes: usize,
+};
+pub const Error = Allocator.Error || error{
+    InvalidUtf8, FrameTooLarge, LineTooLong, TruncatedFrame,
+};
+pub const Frame = struct {
+    event_name: []const u8,
+    data: []const u8,
+};
+pub const Poll = struct {
+    consumed: usize,
+    signal: union(enum) { need_input, yielded, frame: Frame },
+};
+
+pub fn init(allocator: Allocator, limits: Limits) Self;
+pub fn deinit(self: *Self) void;
+pub fn next(self: *Self, input: []const u8, scan_left: *usize) Error!Poll;
+pub fn finish(self: *Self) Error!void;</code></pre>
+<p>next consumes at most scan_left bytes, subtracts that count, and returns at most one frame. It copies partial lines and frames before reporting their input consumed. A Frame borrows packet or decoder bytes. Decode it before the next mutating decoder call or packet release. finish never dispatches an unterminated data frame. The SSE profile linked from the overview defines BOM handling, split CR and LF sequences, comments, and multiline data. Invalid UTF-8 fails rather than being replaced.</p>
+</section>
+<section id="ResponsesDecoder"><h2>Add ResponsesDecoder.zig</h2>
+<p>Owns provider response/item IDs and event-order state. Returned Decoded owns its parsed event document.</p>
+<pre><code>pub const Limits = struct {
+    max_items: u32,
+    max_parts: u32,
+    max_id_bytes: usize,
+};
+pub const Error = Allocator.Error || error{
+    InvalidEvent, InvalidSequence, InvalidIdentity,
+    InvalidTransition, LimitExceeded,
+};
+pub const Channel = enum { text, arguments };
+pub const Item = struct {
+    id: []const u8,
+    output_index: u32,
+    content_index: ?u32,
+    kind: enum { message, function_call, other },
+};
+pub const Update = union(enum) {
+    opened: []const u8,
+    item_started: Item,
+    delta: struct {
+        item: Item,
+        channel: Channel,
+        offset_bytes: u64,
+        bytes: []const u8,
+    },
+    item_finished: Item,
+};
+pub const Final = struct {
+    status: enum { completed, incomplete, failed },
+    response: j.Value,
+};
+pub const Decoded = struct {
+    document: ?j.Document,
+    event: union(enum) { update: Update, final: Final, ignored },
+    pub fn deinit(self: *Decoded) void;
+};
+
+pub fn init(allocator: Allocator, limits: Limits) Self;
+pub fn deinit(self: *Self) void;
+pub fn decode(
+    self: *Self,
+    document_allocator: Allocator,
+    frame: SseDecoder.Frame,
+) Error!Decoded;</code></pre>
+<p>All views in Decoded borrow its document. The decoder copies IDs it retains across calls. Worker owns document_allocator and enforces its quota. The allocator must outlive transferred final documents. decode checks increasing sequence numbers, identities, item and part references, and transitions. Gaps in sequence numbers are allowed. The decoder normalizes only text and function-argument previews. Ignored events still count toward the frame budget. Neither final nor ignored reaches ProgressBatch. ModelResult.take receives the final document rather than rebuilding it from previews.</p>
+</section>
+<section id="ModelStream"><h2>Add ModelStream.zig</h2>
+<p>Owns one HTTP response lifecycle, framing and JSON buffers, a decoder, a pending Decoded, and an optional ModelResult. Its heap address remains stable.</p>
+<pre><code>pub const Limits = struct {
+    max_entity_bytes: usize,
+    max_json_body_bytes: usize,
+    sse: SseDecoder.Limits,
+    events: ResponsesDecoder.Limits,
+    result: ModelResult.Limits,
+};
+pub const Budget = struct {
+    scan_bytes: usize,
+    frames: u32,
+    events: u32,
+};
+pub const HttpMeta = struct {
+    status: u16,
+    content_type: []const u8,
+    content_encoding: []const u8 = "identity",
+};
+pub const Failure = struct {
+    code: enum {
+        invalid_metadata, http_status, unsupported_encoding,
+        invalid_stream, incomplete, provider_failed, refused,
+        limit_exceeded, transport,
+    },
+    http_status: u16 = 0,
+};
+pub const TransportEnd = union(enum) {
+    done,
+    failed: Failure,
+    cancelled,
+};
+pub const RetireReason = enum { cancelled, steered };
+pub const Step = struct {
+    consumed: usize,
+    signal: union(enum) {
+        need_input,
+        yielded,
+        update: *const ResponsesDecoder.Update,
+        ready,
+        stream_fault: Failure,
+        failed: Failure,
+        retired: RetireReason,
+    },
+};
+pub const CreateError = Allocator.Error || error{InvalidLimits};
+
+pub fn create(
+    allocator: Allocator,
+    document_allocator: Allocator,
+    origin: ModelResult.Origin,
+    limits: Limits,
+) CreateError!*Self;
+pub fn destroy(self: *Self) void;
+pub fn acceptMeta(self: *Self, meta: HttpMeta) void;
+pub fn advance(
+    self: *Self,
+    input: []const u8,
+    budget: *Budget,
+) Allocator.Error!Step;
+pub fn acknowledge(self: *Self) void;
+pub fn finish(self: *Self, end: TransportEnd) void;
+pub fn acknowledgeFault(self: *Self) void;
+pub fn reject(self: *Self, failure: Failure) void;
+pub fn retire(self: *Self, reason: RetireReason) void;
+pub fn takeResult(self: *Self) ?ModelResult;</code></pre>
+<p>create copies Origin into ModelResult.Identity. acceptMeta borrows strings for the call and stores a mode enum. Duplicate or missing metadata, a wrong MIME type, a non-UTF-8 charset, or non-identity encoding rejects the stream. Protocol errors become Failure values rather than Worker faults. Failure has no borrowed strings or heap allocation.</p>
+<p>advance subtracts consumed bytes and frames from the budget and returns one action. Worker and ProgressBatch charge budget.events separately. While an update is pending, advance returns the same view without consuming input. acknowledge frees that Decoded only after offer returns accepted or the caller discards it. Never acknowledge after blocked or yielded. advance decodes frames before reporting their bytes consumed.</p>
+<p>Call finish once, after consuming all earlier DATA. It records the transport end. advance performs any final buffered-JSON parse. ready requires HTTP success, validated completed output, and transport done. takeResult transfers the result once. Afterward, do not use origin or result views through the stream.</p>
+<p>On stream_fault, Worker prepares and publishes one abort plus any required IO_CANCEL, then calls acknowledgeFault. Until that call, advance repeats stream_fault without consuming input. It then discards DATA within the byte budget and returns failed only after terminal delivery. Worker stages the failed command at that point. After a stop commits, retire discards previews and results, drains input, then returns retired. work.stop chooses cancellation or steering. destroy releases all remaining state, including partial frames.</p>
+<p>Allocation failure propagates. If decoding exceeds its memory quota, Worker calls reject(limit_exceeded). A system allocation failure may fault the worker instead. Allocator state backing a ModelResult must outlive that result, even after the stream is destroyed.</p>
+</section>
+<section id="EventOutbox"><h2>Add EventOutbox.zig</h2>
+<p>Owns every prepared or published event buffer, its queue slot, and its lease. The old Event implementation becomes private here.</p>
+<pre><code>pub const Class = enum { progress, control, committed };
+pub const Limits = struct {
+    slots: u32,
+    bytes: usize,
+    progress_slots: u32,
+    progress_bytes: usize,
+    max_event_bytes: usize,
+};
+pub const Record = struct {
+    class: Class,
+    kind: u32,
+    operation_id: u64,
+    sequence: u64,
+    request_id: []const u8,
+    method: []const u8,
+    payload: j.Value,
+};
+pub const Batch = struct { id: u64, remaining: u32 };
+pub const PrepareError = Allocator.Error || error{LimitExceeded};
+
+pub fn init(allocator: Allocator, limits: Limits) Allocator.Error!Self;
+pub fn deinit(self: *Self) void;
+pub fn prepareBatch(
+    self: *Self,
+    records: []const Record,
+) PrepareError!?Batch;
+pub fn publish(self: *Self, batch: *?Batch, count: u32) void;
+pub fn discard(self: *Self, batch: *?Batch) void;
+pub fn next(self: *Self, output: *api.cpi_agent_event) bool;
+pub fn release(self: *Self, lease_id: u64) error{StaleEvent}!void;</code></pre>
+<p>prepareBatch borrows records for the call and serializes them into independent immutable buffers. Null means capacity is temporarily unavailable. It takes no record ownership. Oversized events or batches return LimitExceeded. Preparation reserves slots and encoded bytes for the entire batch, including all event classes. It cannot evict delivered events.</p>
+<p>publish moves the next count prepared events into preallocated queue slots without allocation or failure. It reduces remaining and nulls the handle at zero. discard releases only unpublished entries and nulls the handle. Published leases remain valid. Batch is a unique reservation handle and must not be copied. next creates exactly one delivered lease when it returns true. Call release only after the driver has joined all readers.</p>
+<p>A commit batch starts with the journal IO_REQUEST, followed by committed notices. Worker publishes the request before I/O and the notices after the durability acknowledgment. Reserving them together prevents notices from consuming the space needed to dispatch their own append. Worker checks that slots and bytes outside the progress allowance can hold the largest permitted commit batch and control events. A batch larger than its configured limit returns LimitExceeded rather than retrying null forever. The host must still release held control and committed leases.</p>
+</section>
+<section id="ProgressBatch"><h2>Add ProgressBatch.zig</h2>
+<p>Owns only unpublished preview copies and the closed-generation watermark. It has no provider parser or Worker reference.</p>
+<pre><code>pub const Limits = struct {
+    max_records: u32,
+    max_bytes: usize,
+};
+pub const Offer = enum { accepted, blocked, yielded, obsolete };
+pub const Flush = enum { done, blocked, yielded };
+pub const Error = Allocator.Error || error{LimitExceeded};
+
+pub fn init(allocator: Allocator, limits: Limits) Self;
+pub fn deinit(self: *Self) void;
+pub fn offer(
+    self: *Self,
+    outbox: *EventOutbox,
+    origin: ModelResult.Origin,
+    update: *const ResponsesDecoder.Update,
+    events_left: *u32,
+) Error!Offer;
+pub fn flush(
+    self: *Self,
+    outbox: *EventOutbox,
+    events_left: *u32,
+) Error!Flush;
+pub fn discard(self: *Self, generation: u64) void;</code></pre>
+<p>accepted means the update was copied or synchronously published, so ModelStream may acknowledge it. blocked means outbox capacity is unavailable. yielded means the publication budget is exhausted. Neither consumes any part of the supplied update, though an earlier batch may have flushed. obsolete means the generation is closed and the caller may acknowledge and discard the update. events_left decreases only on successful publication. Zero budget returns yielded only when publication is needed.</p>
+<p>Merge only adjacent records with the same generation, item, part, and channel and contiguous UTF-8 byte offsets. A single large delta may bypass merging within the configured event limit. Limits must fit a maximum accepted delta. Permanent size errors must not cause endless blocked retries. Publish synchronously after preparation so no prepared progress batch survives a method call. discard drops unpublished data and rejects later offers for that generation. Worker supplies abort and commit notices separately through its reserved batch.</p>
+</section>
+<section id="Worker"><h2>Change Worker.zig</h2>
+<p>Worker owns input packets, operation slots, durable session state, quota state, and the serialized driver. Add this private state:</p>
+<pre><code>const Outbox = @import("EventOutbox.zig");
+const Stream = @import("ModelStream.zig");
+const Result = @import("ModelResult.zig");
+
+pub const Packet = struct {
+    operation: u64,
+    kind: u32,
+    bytes: []u8,
+    offset: usize,
+};
+pub const Notice = struct {
+    class: Outbox.Class = .committed,
+    kind: u32,
+    operation_id: u64 = 0,
+    request: []const u8 = "",
+    payload: j.Value = .null,
+};
+pub const Commit = struct {
+    phase: enum { queued, writing },
+    document: j.Document,
+    sequence: u64,
+    notices: []Notice,
+    operation: ?u64,
+    batch: ?Outbox.Batch,
+};
+
+outbox: Outbox,
+ready_model: ?Result,
+pending: ?Commit,</code></pre>
+<p>Each HTTP Operation replaces its raw accumulated body with a heap-owned <code>*ModelStream</code>. Per-operation input queues own Packets; ordinary DATA uses aggregate packet/byte credits. A separate bounded terminal slot remains admissible even when DATA is full. Preserve FIFO within each operation. META/terminal limits are separate from cumulative DATA bytes, so a saturated entity quota cannot reject its terminal ERROR. Reserve an operation slot for journal I/O. Operation array addresses never escape a run step.</p>
+<pre><code>pub const FeedError = Allocator.Error || error{
+    InvalidArgument, InvalidState, StaleOperation,
+    LimitExceeded, WouldBlock,
+};
+pub const StageError = Allocator.Error || error{
+    InvalidState, LimitExceeded, JsonTooDeep,
+};
+pub const RequestError = Allocator.Error || error{
+    InvalidState, InvalidLimits, LimitExceeded,
+};
+
+pub fn feed(self: *Self, id: u64, kind: u32, data: []const u8) FeedError!void;
+pub fn stage(self: *Self, document: j.Document, notices: []const Notice) StageError!void;
+pub fn request(
+    self: *Self,
+    kind: Operation.Kind,
+    method: []const u8,
+    request_id: []const u8,
+    payload: j.Value,
+) RequestError!?u64;
+pub fn nextEvent(self: *Self, output: *api.cpi_agent_event) u32;
+pub fn release(self: *Self, lease: u64) error{StaleEvent}!void;
+pub fn run(
+    self: *Self,
+    transitions: u32,
+    instructions: u32,
+    output: *api.cpi_agent_schedule,
+) anyerror!void;</code></pre>
+<p>Operation.Kind is <code>enum { read, write, http, effect }</code>. request returns null when output or operation capacity is temporarily unavailable, without dispatching an operation. For http, Worker assigns the operation ID and creates its ModelStream before publication. Exceeding a permanent limit returns LimitExceeded. feed copies accepted data once. WouldBlock copies nothing and consumes no quota. nextEvent and release delegate lease storage to the outbox.</p>
+<p>stage keeps its current consume-on-success contract, but success now queues an owned Commit even if output space is unavailable. Notice payloads must already belong to document, or be immutable; stage copies the notice array and request IDs into that arena without cloning those payloads again. On error the caller retains document; current state is untouched. It stamps committed records with Commit.sequence and control/progress records with zero; READY uses the control class. While queued, io.pumpCommit prepares one batch containing the append request and its notices. Only then may it publish the request and mark writing. On ack it swaps state and publishes the reserved suffix. No other state mutation occurs during either phase. This avoids changing every Lua/effect caller to retry after it already finished.</p>
+<p>run prioritizes journal acknowledgments, queued commits, and control messages over bounded stream work. Budget exhaustion returns RUNNABLE. Waiting for capacity, input, or an acknowledgment returns WAITING. Do not dispatch a model request while ready_model exists. Replace private emit and replyIndex calls with outbox preparation and per-operation scheduling. Replace cancelExternal with prepared cancellation notices.</p>
+<p>Worker's private DecodeQuota exposes an Allocator, a live-byte count, a configured cap, and a quota-hit flag. It remains at Worker's stable address until every decoded document and result document is freed. Reset the flag before each decode attempt and classify OutOfMemory immediately. Keep allocator callbacks private.</p>
+</section>
+<section id="io"><h2>Change io.zig</h2>
+<pre><code>pub const Pump = enum { idle, advanced, blocked, yielded, settled };
+
+pub fn pumpCommit(worker: *Worker) anyerror!Pump;
+pub fn pump(
+    worker: *Worker,
+    operation_id: u64,
+    budget: *ModelStream.Budget,
+) anyerror!Pump;</code></pre>
+<p>These functions replace process(worker, reply_index). pumpCommit dispatches queued commits or accepts the reserved append acknowledgment. pump routes one operation's META, DATA, and terminal input. It retains packet offsets, calls advance and ProgressBatch, and acknowledges a preview only after handling accepted or obsolete. It never consumes another operation's queue head.</p>
+<p>After ready, move takeResult into Worker.ready_model before releasing the settled operation. After stream_fault, preplan/publish abort plus cancel, then acknowledgeFault. Retain/drain the operation until failed or retired, then use model.fail or work.stop. JSON error payloads never leave borrowed diagnostics behind. recover and validate stay private; committed becomes an allocation-free publish/state-swap path, not fallible event creation.</p>
+</section>
+<section id="model"><h2>Change model.zig</h2>
+<pre><code>pub const Accept = enum { staged, blocked, obsolete };
+pub const Error = Worker.StageError || Worker.RequestError || responses.Error;
+
+pub fn dispatch(worker: *Worker) Error!bool;
+pub fn acceptResult(
+    worker: *Worker,
+    result: *?ModelResult,
+) Error!Accept;
+pub fn retire(worker: *Worker, reason: ModelStream.RetireReason) void;
+pub fn fail(worker: *Worker, code: []const u8, message: []const u8) Error!void;</code></pre>
+<p>Remove receive(worker, HTTP-envelope). dispatch uses request(...). Null means wait and leaves external unset. Do not issue another HTTP request while ready_model or a live HTTP operation exists. acceptResult checks the current request, generation, phase, stop state, and captured revision. blocked leaves the input for the caller to retry. obsolete leaves it for the caller to discard. staged clones output, calls, and the public notice into the candidate, queues stage, then frees and nulls the input. Stage success does not confirm durability.</p>
+<p>retire is called only after the stop checkpoint's prebuilt abort/cancel notices are published. It retires a live ModelStream or discards ready_model and ProgressBatch without allocating. It does not discard known native-effect results. Abort applies only to a still-open model generation; cancelling later Lua/tool work cannot reopen or abort a generation already committed.</p>
+</section>
+<section id="helpers"><h2>Change responses.zig, json.zig, work.zig and logic.zig</h2>
+<h3>responses.zig</h3>
+<pre><code>pub const Config = struct {
+    model: []const u8,
+    base_url: []const u8,
+    reasoning_effort: []const u8,
+    max_output_tokens: u32,
+    instructions: []const u8,
+    stream: bool,
+};
+pub const Error = Allocator.Error || error{
+    InvalidConfig, InvalidInput, InvalidDescriptors, InvalidBaseUrl,
+};
+pub fn url(allocator: Allocator, config: Config) Error![]u8;
+pub fn request(
+    allocator: Allocator,
+    config: Config,
+    input: j.Value,
+    descriptors: j.Value,
+) Error![]u8;</code></pre>
+<p>Add Config.stream and encode it instead of hard-coded false. Keep configuration defaults in code. Move Call and Response ownership and final validation into ModelResult. Remove responses.parse and the old owning Response type. Keep the parameters and return types of request and url, but normalize their errors to Error. Do not add a compatibility wrapper.</p>
+<h3>json.zig</h3>
+<pre><code>pub fn cloneInto(
+    allocator: Allocator,
+    value: Value,
+) (Allocator.Error || error{JsonTooDeep})!Value;</code></pre>
+<p>Add a bounded structured clone that owns all copied strings and containers in allocator. It never borrows input or encodes and reparses values. Keep the existing Document, init, deinit, and parse interfaces.</p>
+<h3>work.zig</h3>
+<pre><code>pub fn prepareModel(document: *j.Document, generation: u64) anyerror!void;</code></pre>
+<p>Set active.generation to the supplied upcoming checkpoint sequence. completeProgram and steering stop pass worker.sequence + 1. advance handles request returning null without dispatching an effect twice. Existing effect-intent/result and Lua methods keep their signatures.</p>
+<h3>logic.zig</h3>
+<pre><code>pub fn admitOne(worker: *Worker) anyerror!bool;
+pub fn control(worker: *Worker) anyerror!bool;
+pub fn advance(worker: *Worker, instructions: u32) anyerror!bool;</code></pre>
+<p>Signatures stay unchanged. Initial model start calls work.prepareModel with the upcoming checkpoint sequence. control includes abort and required IO_CANCEL notices in the stop checkpoint's prepared batch. Cancel covers the active external operation; interrupt-generation steering cancels only HTTP, while at_boundary does not cancel it. The post-ack path updates cancellation flags and calls model.retire without allocating. Already-closed generations produce no second abort. Duplicate-admission observations are prepared as one batch, not partially emitted.</p>
+</section>
+<section id="bridge"><h2>Add abi_bytes.zig; change c_api.zig</h2>
+<pre><code>// abi_bytes.zig: pure views, owns no memory
+pub fn slice(value: api.cpi_agent_bytes) error{InvalidArgument}![]const u8;
+pub fn span(bytes: []const u8) api.cpi_agent_bytes;</code></pre>
+<p>Worker and c_api import abi_bytes rather than events.zig. c_api keeps every exported C function signature. status maps WouldBlock separately from LimitExceeded and maps InvalidLimits to INVALID_ARGUMENT; run must not turn ordinary pressure into fault. The C header/bindings move together to ABI version 2, adding WOULD_BLOCK = 13 and MODEL_RESPONSE_COMMITTED = 12. The struct layouts do not change; no ABI-1 compatibility shim is planned. Journal storage remains independent of the C ABI version.</p>
+<p>The Python adapter and driver must send META{status,content_type,optional content_encoding}, raw DATA, and DONE{}. Retry WouldBlock with unchanged input. Preserve FIFO order within each call while allowing other operations to progress. Continue draining while joining tasks. These changes affect the host, not the Zig module layout. The VM and extension interfaces remain unchanged.</p>
+</section>
+<section id="sequence"><h2>Required call order</h2>
+<ol>
+<li>work.prepareModel stamps generation, then Worker.stage queues its intent checkpoint. Dispatch waits for the durable ack.</li>
+<li>model.dispatch starts HTTP. Worker creates ModelStream and reserves its terminal input slot before publishing IO_REQUEST.</li>
+<li>io.pump feeds raw prefixes to ModelStream.advance. For update, ProgressBatch.offer either copies/publishes it or reports blocked/yielded. Only accepted or deliberate discard permits acknowledge.</li>
+<li>After the provider terminal and transport DONE, takeResult moves into ready_model. model.acceptResult queues the canonical checkpoint and its final-public-output notice.</li>
+<li>io.pumpCommit reserves [append request, notices], publishes only the first, then after fsync ack swaps state and publishes the suffix. Discard that generation's unpublished progress before publishing its close notice.</li>
+<li>Lua may start after the result ack. Native effects still wait for their separate intent ack. Transport failures and cancellation never turn argument previews into calls.</li>
+</ol>
+<p><a href="result-streaming.html">Read the ownership and safety overview</a>.</p>
+</section></main></body></html>
